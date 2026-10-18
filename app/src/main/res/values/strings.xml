@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Reel Counter</string>
+    <string name="accessibility_description">Counts how many reels you swipe through in Instagram and shows a small counter on top of it. Events from other apps are ignored immediately. Only daily totals are stored, on this device, and nothing is sent anywhere.</string>
+</resources>
