@@ -16,4 +16,9 @@ If “Install anyway” isn’t shown, open the Play Store → profile picture �
 3. Open Reel Counter and tap Open Accessibility settings. Find Reel Counter and turn it on.
 If the switch is greyed out or refused (Android 13+), go to Settings → Apps → Reel Counter → ⋮ → Allow restricted settings. Then go back and enable it.
 
-## NO user data is collected or shared
+
+
+## Download
+https://github.com/kushcoded/reel-counter/releases/tag/v1.0
+
+NO user data is collected or shared
