@@ -8,20 +8,12 @@ and shows a tiny draggable counter on top of Instagram.
 2. Run on a device (Android 8.0+ / API 26+) or build an APK: *Build > Build APK(s)*.
 
 ## First-run setup
-1. Open the app and tap **Open Accessibility settings**, then enable **Reel Counter**.
-2. Android 13+ (sideloaded apps): if the switch is greyed out, go to
-   *App info > ⋮ > Allow restricted settings*, then try again.
-3. Open Instagram > Reels and swipe. The pill ("▶ 12") appears while Instagram is in the foreground; drag it anywhere.
+1. Open the APK. If Android asks, tap Settings and turn on Allow from this source.
 
-## How it works
-- An **AccessibilityService** receives scroll events from `com.instagram.android`. Events from other apps are ignored immediately.
-- It only counts when the Reels tab is selected / the reels viewer is on screen, and the scrolling view fills most of the screen
-  (so comment lists and carousels are skipped). Each step forward to the next reel = +1.
-- The pill is an accessibility overlay window, so no "draw over other apps" permission is required.
-- Daily totals are stored locally in SharedPreferences (no internet permission is even declared).
+2. When Play Protect blocks it, tap More details → Install anyway.
+If “Install anyway” isn’t shown, open the Play Store → profile picture → Play Protect → ⚙ and turn off Scan apps with Play Protect. Install the app, then turn the scan back on.
 
-## If counting is off
-Instagram's internal view ids change between versions. Tune the constants at the bottom of `ReelCounterService.kt`:
-`REELS_TAB_IDS`, `VIEWER_IDS`, and the ratios. To find current ids:
-`adb shell uiautomator dump /sdcard/ui.xml && adb pull /sdcard/ui.xml` while a reel is open, then search for `resource-id`.
-Use the **−1 / +1** buttons on the Today tab to correct a day by hand.
+3. Open Reel Counter and tap Open Accessibility settings. Find Reel Counter and turn it on.
+If the switch is greyed out or refused (Android 13+), go to Settings → Apps → Reel Counter → ⋮ → Allow restricted settings. Then go back and enable it.
+
+## NO user data is collected or shared
