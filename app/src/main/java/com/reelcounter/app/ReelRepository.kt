@@ -42,8 +42,8 @@ object AppSettings {
     const val DEFAULT_LIMIT = 100
     const val MAX_TRANSPARENCY = 1f
     const val DEFAULT_CM_PER_REEL = 13.5f
-    const val MIN_CM_PER_REEL = 5f
-    const val MAX_CM_PER_REEL = 20f
+    const val MIN_CM_PER_REEL = 10f
+    const val MAX_CM_PER_REEL = 17f
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
@@ -51,6 +51,7 @@ object AppSettings {
     private val _transparency = MutableStateFlow(0.2f)
     private val _fallbackSeconds = MutableStateFlow(3)
     private val _cmPerReel = MutableStateFlow(DEFAULT_CM_PER_REEL)
+    private val _darkTheme = MutableStateFlow(true)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
     /** Daily limit; the popup turns red once today's count is above it. */
@@ -61,6 +62,8 @@ object AppSettings {
     val fallbackSeconds: StateFlow<Int> = _fallbackSeconds.asStateFlow()
     /** Thumb travel per reel, in cm; drives every distance figure. */
     val cmPerReel: StateFlow<Float> = _cmPerReel.asStateFlow()
+    /** App theme; dark by default. */
+    val darkTheme: StateFlow<Boolean> = _darkTheme.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
@@ -70,7 +73,13 @@ object AppSettings {
         _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
         _transparency.value = prefs.getFloat("transparency", 0.2f).coerceIn(0f, MAX_TRANSPARENCY)
         _fallbackSeconds.value = prefs.getInt("fallback_seconds", 3)
+        _darkTheme.value = prefs.getBoolean("dark_theme", true)
         _cmPerReel.value = prefs.getFloat("cm_per_reel", DEFAULT_CM_PER_REEL).coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
+    }
+
+    fun setDarkTheme(dark: Boolean) {
+        prefs.edit().putBoolean("dark_theme", dark).apply()
+        _darkTheme.value = dark
     }
 
     fun setOverlayEnabled(enabled: Boolean) {

@@ -7,7 +7,6 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.compose.foundation.background
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -19,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,9 +29,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -54,8 +58,7 @@ private val DATE_SHORT: DateTimeFormatter = DateTimeFormatter.ofPattern("EEE, d 
 private val DATE_DAY_MONTH: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM")
 
 @Composable
-fun ReelCounterTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
+fun ReelCounterTheme(dark: Boolean, content: @Composable () -> Unit) {
     val ctx = LocalContext.current
     val scheme = when {
         Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
@@ -65,6 +68,8 @@ fun ReelCounterTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = scheme, content = content)
 }
 
+// ---------------------------------------------------------------------------- Root
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppRoot() {
@@ -73,6 +78,7 @@ fun AppRoot() {
     val counts by ReelRepository.counts.collectAsStateWithLifecycle()
     val limit by AppSettings.limit.collectAsStateWithLifecycle()
     val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
+    val dark by AppSettings.darkTheme.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -83,6 +89,13 @@ fun AppRoot() {
                         IconButton(onClick = { confirmClear = true }) {
                             Icon(Icons.Default.Delete, contentDescription = "Clear history")
                         }
+                    }
+                    IconButton(onClick = { AppSettings.setDarkTheme(!dark) }) {
+                        Text(
+                            if (dark) "☀️" else "🌙",
+                            fontSize = 20.sp,
+                            modifier = Modifier.semantics { contentDescription = if (dark) "Switch to light theme" else "Switch to dark theme" }
+                        )
                     }
                 }
             )
@@ -100,7 +113,7 @@ fun AppRoot() {
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(counts, limit, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, limit, cmPerReel, Modifier.padding(padding))
         else HistoryScreen(counts, limit, cmPerReel, Modifier.padding(padding))
     }
 
@@ -108,7 +121,7 @@ fun AppRoot() {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("Clear all history?") },
-            text = { Text("This deletes every daily total. It can't be undone.") },
+            text = { Text("This deletes every daily total.") },
             confirmButton = {
                 TextButton(onClick = { ReelRepository.clearAll(); confirmClear = false }) { Text("Clear") }
             },
@@ -117,14 +130,48 @@ fun AppRoot() {
     }
 }
 
-// ---------------------------------------------------------------------------- Home
+// ---------------------------------------------------------------------------- Shared bits
+
+/** Small (i) button; the explanation lives in a dialog so cards stay uncluttered. */
+@Composable
+private fun InfoButton(title: String, text: String) {
+    var show by remember { mutableStateOf(false) }
+    IconButton(onClick = { show = true }, modifier = Modifier.size(36.dp)) {
+        Icon(
+            Icons.Default.Info, contentDescription = "About $title",
+            modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    if (show) {
+        AlertDialog(
+            onDismissRequest = { show = false },
+            title = { Text(title) },
+            text = { Text(text) },
+            confirmButton = { TextButton(onClick = { show = false }) { Text("Got it") } }
+        )
+    }
+}
 
 @Composable
-fun HomeScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifier) {
+private fun CardTitle(title: String, info: String? = null, trailing: @Composable () -> Unit = {}) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        if (info != null) {
+            Spacer(Modifier.width(2.dp))
+            InfoButton(title, info)
+        }
+        Spacer(Modifier.weight(1f))
+        trailing()
+    }
+}
+
+// ---------------------------------------------------------------------------- Today tab
+
+@Composable
+fun HomeScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val totalReels = remember(counts) { counts.values.sum() }
-    val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val serviceOn by rememberServiceEnabled()
 
     Column(
@@ -144,12 +191,13 @@ fun HomeScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifi
 @Composable
 private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
     val over = count > limit
-    val numberColor = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
-
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Text(today.format(DATE_LONG), style = MaterialTheme.typography.labelLarge)
-            Text(count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold, color = numberColor)
+            Text(
+                count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
+                color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
+            )
             Text("reels watched today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
@@ -159,16 +207,10 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (over) "Over your daily limit of $limit by ${count - limit}" else "Daily limit $limit  ·  ${limit - count} left",
+                if (over) "${count - limit} over your limit of $limit" else "${limit - count} left of $limit",
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Fix count", style = MaterialTheme.typography.labelMedium)
-                OutlinedButton(onClick = { ReelRepository.adjustToday(-1) }, enabled = count > 0) { Text("−1") }
-                OutlinedButton(onClick = { ReelRepository.adjustToday(1) }) { Text("+1") }
-            }
         }
     }
 }
@@ -177,13 +219,9 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
 private fun LimitCard(limit: Int) {
     var edit by remember { mutableStateOf(false) }
 
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+    Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("Daily limit", style = MaterialTheme.typography.titleMedium)
-                    Text("The popup turns red when you go over", style = MaterialTheme.typography.bodySmall)
-                }
+            CardTitle("Daily limit", "Your daily reel limit. The floating counter and the chart bars turn red once you go over it.") {
                 Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -222,19 +260,51 @@ private fun LimitCard(limit: Int) {
 }
 
 @Composable
+private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
+    val days = remember(today) { (6 downTo 0).map { today.minusDays(it.toLong()) } }
+    val values = remember(counts, today) { days.map { counts[it.toString()] ?: 0 } }
+    val max = values.max().coerceAtLeast(1)
+    val total = values.sum()
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            CardTitle("Last 7 days", "Bars turn red on days you went over your daily limit.")
+            Row(Modifier.fillMaxWidth().height(130.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                days.forEachIndexed { i, d ->
+                    val barColor = if (values[i] > limit) OverLimitRed else MaterialTheme.colorScheme.primary
+                    Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
+                        Text(values[i].toString(), style = MaterialTheme.typography.labelSmall)
+                        Spacer(Modifier.height(2.dp))
+                        Box(
+                            Modifier.fillMaxWidth().height((80f * values[i] / max).coerceAtLeast(3f).dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(barColor.copy(alpha = if (i == 6) 1f else 0.5f))
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(d.dayOfWeek.getDisplayName(TextStyle.NARROW, Locale.getDefault()), style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+            Text("Total $total  ·  avg ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
 private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
+    val info = buildString {
+        append("Distance = reels watched × scroll length per reel. Changing the length recalculates every day, including past ones.")
+        fact.next?.let { append("\n\n").append(it) }
+    }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Distance scrolled", style = MaterialTheme.typography.titleMedium)
+            CardTitle("Distance scrolled", info)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 DistanceStat("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
                 DistanceStat("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
             }
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-            fact.next?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
             HorizontalDivider()
             Text(
                 "Scroll length per reel: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
@@ -245,9 +315,8 @@ private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
                 onValueChange = { AppSettings.setCmPerReel(it) },
                 onValueChangeFinished = { AppSettings.persistCmPerReel() },
                 valueRange = AppSettings.MIN_CM_PER_REEL..AppSettings.MAX_CM_PER_REEL,
-                steps = 29   // 0.5 cm steps from 5 to 20
+                steps = 13   // 0.5 cm steps from 10 to 17
             )
-            Text("Changing this recalculates all distances, including past days.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -267,11 +336,11 @@ private fun PopupCard(count: Int, limit: Int) {
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("Floating counter", style = MaterialTheme.typography.titleMedium)
-                    Text("Small draggable popup while you're in Instagram", style = MaterialTheme.typography.bodySmall)
-                }
+            CardTitle(
+                "Floating counter",
+                "Shows your count on top of Instagram. You can drag it anywhere on screen and it remembers where you left it. " +
+                        "Transparency only fades the dark background; the number stays solid."
+            ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
             Text("Background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
@@ -298,7 +367,6 @@ private fun PopupCard(count: Int, limit: Int) {
                 onValueChangeFinished = { AppSettings.persistTransparency() },
                 valueRange = 0f..AppSettings.MAX_TRANSPARENCY
             )
-            Text("Only the dark background fades; the number stays solid.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -308,18 +376,15 @@ private fun WatchRuleCard() {
     val seconds by AppSettings.fallbackSeconds.collectAsStateWithLifecycle()
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("What counts as a reel", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "A reel counts once you've watched about 30% of it. Going back up and down again never counts the same reel twice.",
-                style = MaterialTheme.typography.bodySmall
+            CardTitle(
+                "What counts as a reel",
+                "A reel counts once you've watched about 30% of it. Scrolling back up and down never counts the same reel twice.\n\n" +
+                        "If your Instagram version doesn't share playback progress, a reel counts after the fallback time below instead."
             )
-            Text(
-                "If your Instagram version doesn't share playback progress, a reel counts after this many seconds on it instead:",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Fallback watch time", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
-                Text("$seconds s", style = MaterialTheme.typography.titleMedium)
+                Text("$seconds s", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp))
                 OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
             }
         }
@@ -336,17 +401,14 @@ private fun SetupCard() {
                 Text("Turn on the counter", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                "Enable Reel Counter under Accessibility → Installed apps so it can notice which reel you're watching in Instagram. Everything stays on your phone.",
+                "Enable Reel Counter in Accessibility settings so it can see which reel you're on. Everything stays on your phone.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
                 Text("Open Accessibility settings")
             }
             if (Build.VERSION.SDK_INT >= 33) {
-                Text(
-                    "Switch greyed out? On Android 13+, open App info, tap ⋮ and choose “Allow restricted settings”.",
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text("Greyed out? App info → ⋮ → Allow restricted settings.", style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = {
                     ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
                 }) { Text("Open App info") }
@@ -355,78 +417,66 @@ private fun SetupCard() {
     }
 }
 
-@Composable
-private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
-    val days = (6 downTo 0).map { today.minusDays(it.toLong()) }
-    val values = days.map { counts[it.toString()] ?: 0 }
-    val max = values.max().coerceAtLeast(1)
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Last 7 days", style = MaterialTheme.typography.titleMedium)
-            Row(Modifier.fillMaxWidth().height(130.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                days.forEachIndexed { i, d ->
-                    val barColor = if (values[i] > limit) OverLimitRed else MaterialTheme.colorScheme.primary
-                    Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
-                        Text(values[i].toString(), style = MaterialTheme.typography.labelSmall)
-                        Spacer(Modifier.height(2.dp))
-                        Box(
-                            Modifier.fillMaxWidth().height((80f * values[i] / max).coerceAtLeast(3f).dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(barColor.copy(alpha = if (i == 6) 1f else 0.5f))
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(d.dayOfWeek.getDisplayName(TextStyle.NARROW, Locale.getDefault()), style = MaterialTheme.typography.labelSmall)
-                    }
-                }
-            }
-            val total = values.sum()
-            Text("Week total $total  ·  avg ${total / 7} per day  ·  red = over limit", style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------- History
+// ---------------------------------------------------------------------------- History tab
 
 @Composable
 fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
-    val first = counts.keys.mapNotNull { runCatching { LocalDate.parse(it) }.getOrNull() }.minOrNull() ?: today
-    val days = remember(first, today) { generateSequence(today) { it.minusDays(1) }.takeWhile { !it.isBefore(first) }.toList() }
-    val total = counts.values.sum()
-    val worst = counts.values.maxOrNull() ?: 0
-    val barMax = worst.coerceAtLeast(1)
-    val worstDate = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }?.key?.let {
-        runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull()
+    // Only days that have reels, plus today; newest first.
+    val rows = remember(counts, today) {
+        counts.filter { it.value > 0 }.keys
+            .mapNotNull { runCatching { LocalDate.parse(it) }.getOrNull() }
+            .plus(today).distinct().sortedDescending()
     }
+    val total = remember(counts) { counts.values.sum() }
+    val activeDays = remember(counts) { counts.values.count { it > 0 }.coerceAtLeast(1) }
+    val dailyAvg = total / activeDays
+    val worst = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }
+    val barMax = (worst?.value ?: 0).coerceAtLeast(1)
+    val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull() } ?: "–"
 
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatCard("Total", total.toString(), Modifier.weight(1f), Distance.formatKm(Distance.kilometers(total, cmPerReel)))
-                StatCard("Avg / day", (total / days.size).toString(), Modifier.weight(1f))
-                StatCard("Worst day", worst.toString(), Modifier.weight(1f), worstDate)
+            // Equal-height cards: every card has the same three lines (value, title, detail).
+            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatCard("Total", total.toString(), Distance.formatKm(Distance.kilometers(total, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
+                StatCard("Daily avg", dailyAvg.toString(), Distance.formatMeters(Distance.meters(dailyAvg, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
+                StatCard("Worst day", (worst?.value ?: 0).toString(), worstDate, Modifier.weight(1f).fillMaxHeight())
             }
         }
-        if (total == 0) item {
-            Text("No reels counted yet. Open Instagram's Reels and start watching.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 8.dp))
-        }
-        items(days, key = { it.toString() }) { d ->
-            val c = counts[d.toString()] ?: 0
-            val over = c > limit
-            val label = when (d) {
-                today -> "Today"
-                today.minusDays(1) -> "Yesterday"
-                else -> d.format(DATE_SHORT)
+        if (total == 0) {
+            item {
+                Text(
+                    "No reels counted yet.\nWatch some Reels in Instagram and they'll show up here.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp)
+                )
             }
-            Card(Modifier.fillMaxWidth()) {
-                Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        } else {
+            items(rows, key = { it.toString() }) { d ->
+                val c = counts[d.toString()] ?: 0
+                val over = c > limit
+                val label = when (d) {
+                    today -> "Today"
+                    today.minusDays(1) -> "Yesterday"
+                    else -> d.format(DATE_SHORT)
+                }
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                            Column(Modifier.weight(1f)) {
+                                Text(label, style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    Distance.formatMeters(Distance.meters(c, cmPerReel)),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             Text(
-                                Distance.formatMeters(Distance.meters(c, cmPerReel)),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                c.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
+                                color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
                             )
                         }
                         LinearProgressIndicator(
@@ -435,11 +485,6 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifi
                             modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp))
                         )
                     }
-                    Spacer(Modifier.width(16.dp))
-                    Text(
-                        c.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
-                        color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
-                    )
                 }
             }
         }
@@ -447,12 +492,12 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifi
 }
 
 @Composable
-private fun StatCard(title: String, value: String, modifier: Modifier, subtitle: String? = null) {
+private fun StatCard(title: String, value: String, detail: String, modifier: Modifier) {
     Card(modifier) {
-        Column(Modifier.padding(12.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            Text(title, style = MaterialTheme.typography.labelMedium)
-            if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.labelSmall)
+        Column(Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(title, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+            Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
         }
     }
 }

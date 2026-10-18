@@ -17,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
@@ -73,6 +74,8 @@ class ReelCounterService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        scope.coroutineContext.cancelChildren()
+        runCatching { unregisterReceiver(screenOffReceiver) }
         ReelRepository.init(this)
         AppSettings.init(this)
         overlay = ReelOverlay(this)
@@ -86,6 +89,9 @@ class ReelCounterService : AccessibilityService() {
                 .collect { overlay.refresh() }
         }
         scope.launch { AppSettings.overlayEnabled.collect { syncOverlay() } }
+
+        updateEventTypes(instagramOpen = false)   // scroll events only matter while Instagram is open
+        if (rootInActiveWindow?.packageName?.toString() == INSTAGRAM) { setForeground(true); syncOverlay() }
     }
 
     // ------------------------------------------------------------------ events
@@ -153,14 +159,36 @@ class ReelCounterService : AccessibilityService() {
     private fun setForeground(value: Boolean) {
         if (igForeground == value) return
         igForeground = value
+        updateEventTypes(value)
         if (value) {
-            tickerJob = scope.launch { while (isActive) { delay(TICK_MS); tick() } }
+            tickerJob = scope.launch {
+                while (isActive) {
+                    // Poll fast only while a reel is being timed, slowly otherwise.
+                    delay(if (currentIndex != NONE && !currentCounted) TICK_MS else IDLE_TICK_MS)
+                    tick()
+                }
+            }
         } else {
             tickerJob?.cancel()
             tickerJob = null
             resetTracking()
+            // Instagram was closed: forget which reels were counted, so its next session
+            // (which starts again from position 0) never has new reels skipped.
+            countedIndices.clear()
+            pseudoIndex = 0
         }
         syncOverlay()
+    }
+
+    /** Other apps' scroll events are pure overhead, so only subscribe to them while Instagram is open. */
+    private fun updateEventTypes(instagramOpen: Boolean) {
+        val info = serviceInfo ?: return
+        val wanted = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                (if (instagramOpen) AccessibilityEvent.TYPE_VIEW_SCROLLED else 0)
+        if (info.eventTypes != wanted) {
+            info.eventTypes = wanted
+            serviceInfo = info
+        }
     }
 
     private fun startTracking(index: Int, now: Long) {
@@ -305,6 +333,7 @@ class ReelCounterService : AccessibilityService() {
         private const val WATCH_FRACTION = 0.3f          // "watched 30% or more"
         private const val MIN_DWELL_MS = 1000L           // ignore progress readings right after a swipe
         private const val TICK_MS = 400L
+        private const val IDLE_TICK_MS = 1200L
         private const val SESSION_TIMEOUT_MS = 120_000L  // forget "already counted" after 2 min away
         private const val MAX_NODES = 250
         private const val PROGRESS_SEARCH_INTERVAL_MS = 1500L
