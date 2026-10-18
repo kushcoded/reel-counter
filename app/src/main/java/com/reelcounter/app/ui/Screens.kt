@@ -49,6 +49,7 @@ import com.reelcounter.app.AppSettings
 import com.reelcounter.app.Distance
 import com.reelcounter.app.ReelCounterService
 import com.reelcounter.app.ReelRepository
+import com.reelcounter.app.WatchTime
 import kotlinx.coroutines.delay
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -84,6 +85,7 @@ fun AppRoot() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
     val counts by ReelRepository.counts.collectAsStateWithLifecycle()
+    val watch by ReelRepository.watchMs.collectAsStateWithLifecycle()
     val limit by AppSettings.limit.collectAsStateWithLifecycle()
     val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val dark by AppSettings.darkTheme.collectAsStateWithLifecycle()
@@ -120,8 +122,8 @@ fun AppRoot() {
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(counts, limit, cmPerReel, Modifier.padding(padding))
-        else HistoryScreen(counts, limit, cmPerReel, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
+        else HistoryScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
     }
 
     if (confirmClear) {
@@ -196,10 +198,13 @@ private fun CardTitle(title: String, info: String? = null, trailing: @Composable
 // ---------------------------------------------------------------------------- Today tab
 
 @Composable
-fun HomeScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
+fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val totalReels = remember(counts) { counts.values.sum() }
+    val todayWatch = watch[today.toString()] ?: 0L
+    val totalWatch = remember(watch) { watch.values.sum() }
+    val watchDays = remember(watch) { watch.values.count { it > 0 }.coerceAtLeast(1) }
     val serviceOn by rememberServiceEnabled()
 
     Column(
@@ -210,6 +215,7 @@ fun HomeScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier:
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
         WeekCard(counts, limit, today)
+        WatchTimeCard(todayWatch, totalWatch, totalWatch / watchDays)
         DistanceCard(todayCount, totalReels, cmPerReel)
         PopupCard(todayCount, limit)
         WatchRuleCard()
@@ -315,6 +321,20 @@ private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
 }
 
 @Composable
+private fun WatchTimeCard(todayMs: Long, totalMs: Long, avgMs: Long) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            CardTitle("Watch time", "Time spent on the Reels screen in Instagram. The daily average covers the days you watched.")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatBlock("Today", WatchTime.format(todayMs), Modifier.weight(1f), compact = true)
+                StatBlock("All time", WatchTime.format(totalMs), Modifier.weight(1f), compact = true)
+                StatBlock("Daily avg", WatchTime.format(avgMs), Modifier.weight(1f), compact = true)
+            }
+        }
+    }
+}
+
+@Composable
 private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     val info = buildString {
@@ -325,8 +345,8 @@ private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             CardTitle("Distance scrolled", info)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                DistanceStat("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
-                DistanceStat("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
+                StatBlock("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
+                StatBlock("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
             }
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             HorizontalDivider()
@@ -346,9 +366,13 @@ private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
 }
 
 @Composable
-private fun DistanceStat(title: String, value: String, modifier: Modifier) {
+private fun StatBlock(title: String, value: String, modifier: Modifier, compact: Boolean = false) {
     Column(modifier) {
-        Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(
+            value,
+            style = if (compact) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold, maxLines = 1
+        )
         Text(title, style = MaterialTheme.typography.labelMedium)
     }
 }
@@ -444,7 +468,7 @@ private fun SetupCard() {
 // ---------------------------------------------------------------------------- History tab
 
 @Composable
-fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
+fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     // Only days that have reels, plus today; newest first.
     val rows = remember(counts, today) {
@@ -501,8 +525,10 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifi
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(label, style = MaterialTheme.typography.bodyLarge)
+                                val w = watch[d.toString()] ?: 0L
+                                val dist = Distance.formatMeters(Distance.meters(c, cmPerReel))
                                 Text(
-                                    Distance.formatMeters(Distance.meters(c, cmPerReel)),
+                                    if (w > 0) "$dist  ·  ${WatchTime.format(w)}" else dist,
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )

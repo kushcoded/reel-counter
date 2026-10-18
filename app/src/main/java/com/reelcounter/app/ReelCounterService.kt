@@ -22,7 +22,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.time.LocalDate
 
 /**
  * Watches Instagram Reels and counts a reel once it has been watched ~30%.
@@ -63,6 +62,10 @@ class ReelCounterService : AccessibilityService() {
     private var progressNode: AccessibilityNodeInfo? = null
     private var progressSearchAt = 0L
     private var lastDay = ""
+
+    // Watch time: accumulated in memory, written to disk in batches
+    private var watchMark = 0L          // uptime up to which time has been accounted; 0 = not on Reels
+    private var watchPendingMs = 0L
 
     // Reels-screen detection cache
     private var reelsCheckedAt = 0L
@@ -202,6 +205,7 @@ class ReelCounterService : AccessibilityService() {
     }
 
     private fun resetTracking() {
+        endWatch(SystemClock.uptimeMillis())
         if (currentIndex != NONE) leftAt = SystemClock.uptimeMillis()
         currentIndex = NONE
         currentCounted = false
@@ -212,10 +216,16 @@ class ReelCounterService : AccessibilityService() {
 
     private fun tick() {
         if (!igForeground) return
-        val day = LocalDate.now().toString()
+        val day = DayClock.today()
         if (day != lastDay) { lastDay = day; overlay.refresh() }   // new day: popup goes back to 0
         if (!isInReels()) { resetTracking(); return }
         val now = SystemClock.uptimeMillis()
+        if (watchMark == 0L) {
+            watchMark = now
+        } else {
+            accountWatch(now)
+            if (watchPendingMs >= WATCH_FLUSH_MS) flushWatch()
+        }
         if (currentIndex == NONE) {
             // New visit to Reels. Keep old "already counted" memory unless we've been away a while.
             if (now - leftAt > SESSION_TIMEOUT_MS) countedIndices.clear()
@@ -237,6 +247,27 @@ class ReelCounterService : AccessibilityService() {
             if (currentIndex != UNKNOWN) countedIndices.add(currentIndex)
             ReelRepository.adjustToday(1)
         }
+    }
+
+    // ------------------------------------------------------------------ watch time
+
+    private fun accountWatch(now: Long) {
+        if (watchMark == 0L) return
+        val d = now - watchMark
+        watchMark = now
+        if (d in 1..MAX_WATCH_GAP_MS) watchPendingMs += d   // ignore long gaps (device hiccups)
+    }
+
+    private fun flushWatch() {
+        if (watchPendingMs <= 0L) return
+        ReelRepository.addWatchMs(watchPendingMs)
+        watchPendingMs = 0L
+    }
+
+    /** Left Reels (or Instagram, or the service stopped): account the last stretch and save. */
+    private fun endWatch(now: Long) {
+        if (watchMark != 0L) { accountWatch(now); watchMark = 0L }
+        flushWatch()
     }
 
     /** Playback progress (0..1) if Instagram exposes its thin progress bar to accessibility, else null. */
@@ -283,7 +314,7 @@ class ReelCounterService : AccessibilityService() {
     /** True when the Reels tab is selected or the full-screen reels viewer is on screen. */
     private fun isInReels(): Boolean {
         val now = SystemClock.uptimeMillis()
-        if (now - reelsCheckedAt < 500) return reelsCached
+        if (now - reelsCheckedAt < IN_REELS_CACHE_MS) return reelsCached
         val root = rootInActiveWindow ?: return reelsCached
         if (root.packageName?.toString() != INSTAGRAM) return reelsCached
         reelsCheckedAt = now
@@ -312,11 +343,13 @@ class ReelCounterService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         if (::overlay.isInitialized) overlay.hide()
+        endWatch(SystemClock.uptimeMillis())
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(screenOffReceiver) }
+        endWatch(SystemClock.uptimeMillis())
         scope.cancel()
         super.onDestroy()
     }
@@ -334,6 +367,9 @@ class ReelCounterService : AccessibilityService() {
         private const val MIN_DWELL_MS = 1000L           // ignore progress readings right after a swipe
         private const val TICK_MS = 400L
         private const val IDLE_TICK_MS = 1200L
+        private const val IN_REELS_CACHE_MS = 900L
+        private const val MAX_WATCH_GAP_MS = 3000L
+        private const val WATCH_FLUSH_MS = 15_000L
         private const val SESSION_TIMEOUT_MS = 120_000L  // forget "already counted" after 2 min away
         private const val MAX_NODES = 250
         private const val PROGRESS_SEARCH_INTERVAL_MS = 1500L

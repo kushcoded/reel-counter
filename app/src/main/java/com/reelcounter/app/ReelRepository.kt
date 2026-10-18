@@ -5,35 +5,53 @@ import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.time.LocalDate
 
 /** Daily reel totals, keyed by ISO date ("2026-10-18"). Shared by the UI and the accessibility service. */
 object ReelRepository {
     private lateinit var prefs: SharedPreferences
+    private lateinit var watchPrefs: SharedPreferences
     private val _counts = MutableStateFlow<Map<String, Int>>(emptyMap())
     val counts: StateFlow<Map<String, Int>> = _counts.asStateFlow()
+
+    /** Milliseconds spent on the Reels screen, per day. */
+    private val _watchMs = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val watchMs: StateFlow<Map<String, Long>> = _watchMs.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences("reel_counts", Context.MODE_PRIVATE)
         _counts.value = prefs.all.mapNotNull { (k, v) -> (v as? Int)?.let { k to it } }.toMap()
+        watchPrefs = context.applicationContext.getSharedPreferences("watch_time", Context.MODE_PRIVATE)
+        _watchMs.value = watchPrefs.all.mapNotNull { (k, v) -> (v as? Long)?.let { k to it } }.toMap()
     }
 
-    fun todayCount(): Int = _counts.value[LocalDate.now().toString()] ?: 0
+    fun todayCount(): Int = _counts.value[DayClock.today()] ?: 0
 
     @Synchronized
     fun adjustToday(delta: Int) {
-        val key = LocalDate.now().toString()
+        val key = DayClock.today()
         val updated = ((_counts.value[key] ?: 0) + delta).coerceAtLeast(0)
         prefs.edit().putInt(key, updated).apply()
         _counts.value = _counts.value + (key to updated)
     }
 
+    /** Called by the service in batches (not per tick), so disk writes stay rare. */
+    @Synchronized
+    fun addWatchMs(delta: Long) {
+        if (delta <= 0) return
+        val key = DayClock.today()
+        val updated = (_watchMs.value[key] ?: 0L) + delta
+        watchPrefs.edit().putLong(key, updated).apply()
+        _watchMs.value = _watchMs.value + (key to updated)
+    }
+
     @Synchronized
     fun clearAll() {
         prefs.edit().clear().apply()
+        watchPrefs.edit().clear().apply()
         _counts.value = emptyMap()
+        _watchMs.value = emptyMap()
     }
 }
 
