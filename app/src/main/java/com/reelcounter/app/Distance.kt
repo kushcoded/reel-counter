@@ -4,11 +4,9 @@ import java.util.Locale
 
 /** Distance maths and the static "that's about the size of..." fun facts. */
 object Distance {
-    /** Thumb travel per reel watched. */
-    const val CM_PER_REEL = 16.0
-
-    fun meters(reels: Int): Double = reels * CM_PER_REEL / 100.0
-    fun kilometers(reels: Int): Double = meters(reels) / 1000.0
+    /** [cmPerReel] is the user-adjustable thumb travel per reel watched. */
+    fun meters(reels: Int, cmPerReel: Float): Double = reels * cmPerReel.toDouble() / 100.0
+    fun kilometers(reels: Int, cmPerReel: Float): Double = meters(reels, cmPerReel) / 1000.0
 
     fun formatMeters(m: Double): String = String.format(Locale.getDefault(), "%.1f m", m)
 
@@ -48,8 +46,8 @@ object Distance {
         Landmark(384_400_000.0, "the distance to the Moon"),
     )
 
-    fun funFact(reels: Int): FunFact {
-        val m = meters(reels)
+    fun funFact(reels: Int, cmPerReel: Float): FunFact {
+        val m = meters(reels, cmPerReel)
         val i = landmarks.indexOfLast { it.meters <= m }
         if (i < 0) {
             val first = landmarks.first()

@@ -41,12 +41,16 @@ object ReelRepository {
 object AppSettings {
     const val DEFAULT_LIMIT = 100
     const val MAX_TRANSPARENCY = 1f
+    const val DEFAULT_CM_PER_REEL = 13.5f
+    const val MIN_CM_PER_REEL = 5f
+    const val MAX_CM_PER_REEL = 20f
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
     private val _limit = MutableStateFlow(DEFAULT_LIMIT)
     private val _transparency = MutableStateFlow(0.2f)
     private val _fallbackSeconds = MutableStateFlow(3)
+    private val _cmPerReel = MutableStateFlow(DEFAULT_CM_PER_REEL)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
     /** Daily limit; the popup turns red once today's count is above it. */
@@ -55,6 +59,8 @@ object AppSettings {
     val transparency: StateFlow<Float> = _transparency.asStateFlow()
     /** Used only when Instagram doesn't expose playback progress: a reel counts after this long. */
     val fallbackSeconds: StateFlow<Int> = _fallbackSeconds.asStateFlow()
+    /** Thumb travel per reel, in cm; drives every distance figure. */
+    val cmPerReel: StateFlow<Float> = _cmPerReel.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
@@ -64,6 +70,7 @@ object AppSettings {
         _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
         _transparency.value = prefs.getFloat("transparency", 0.2f).coerceIn(0f, MAX_TRANSPARENCY)
         _fallbackSeconds.value = prefs.getInt("fallback_seconds", 3)
+        _cmPerReel.value = prefs.getFloat("cm_per_reel", DEFAULT_CM_PER_REEL).coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
     }
 
     fun setOverlayEnabled(enabled: Boolean) {
@@ -80,6 +87,15 @@ object AppSettings {
     /** Live update while the slider moves; call [persistTransparency] when the finger lifts. */
     fun setTransparency(value: Float) {
         _transparency.value = value.coerceIn(0f, MAX_TRANSPARENCY)
+    }
+
+    /** Live update while the slider moves; call [persistCmPerReel] when the finger lifts. */
+    fun setCmPerReel(value: Float) {
+        _cmPerReel.value = value.coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
+    }
+
+    fun persistCmPerReel() {
+        prefs.edit().putFloat("cm_per_reel", _cmPerReel.value).apply()
     }
 
     fun persistTransparency() {

@@ -72,6 +72,7 @@ fun AppRoot() {
     var confirmClear by remember { mutableStateOf(false) }
     val counts by ReelRepository.counts.collectAsStateWithLifecycle()
     val limit by AppSettings.limit.collectAsStateWithLifecycle()
+    val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -100,7 +101,7 @@ fun AppRoot() {
         }
     ) { padding ->
         if (tab == 0) HomeScreen(counts, limit, Modifier.padding(padding))
-        else HistoryScreen(counts, limit, Modifier.padding(padding))
+        else HistoryScreen(counts, limit, cmPerReel, Modifier.padding(padding))
     }
 
     if (confirmClear) {
@@ -123,6 +124,7 @@ fun HomeScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifi
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val totalReels = remember(counts) { counts.values.sum() }
+    val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val serviceOn by rememberServiceEnabled()
 
     Column(
@@ -132,8 +134,8 @@ fun HomeScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifi
         if (!serviceOn) SetupCard()
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
-        DistanceCard(todayCount, totalReels)
         WeekCard(counts, limit, today)
+        DistanceCard(todayCount, totalReels, cmPerReel)
         PopupCard(todayCount, limit)
         WatchRuleCard()
     }
@@ -220,20 +222,32 @@ private fun LimitCard(limit: Int) {
 }
 
 @Composable
-private fun DistanceCard(todayReels: Int, totalReels: Int) {
-    val fact = remember(totalReels) { Distance.funFact(totalReels) }
+private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
+    val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Distance scrolled", style = MaterialTheme.typography.titleMedium)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                DistanceStat("Today", Distance.formatMeters(Distance.meters(todayReels)), Modifier.weight(1f))
-                DistanceStat("All time", Distance.formatKm(Distance.kilometers(totalReels)), Modifier.weight(1f))
+                DistanceStat("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
+                DistanceStat("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
             }
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             fact.next?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text("Based on ${Distance.CM_PER_REEL.toInt()} cm of scrolling per reel", style = MaterialTheme.typography.labelSmall)
+            HorizontalDivider()
+            Text(
+                "Scroll length per reel: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Slider(
+                value = cmPerReel,
+                onValueChange = { AppSettings.setCmPerReel(it) },
+                onValueChangeFinished = { AppSettings.persistCmPerReel() },
+                valueRange = AppSettings.MIN_CM_PER_REEL..AppSettings.MAX_CM_PER_REEL,
+                steps = 29   // 0.5 cm steps from 5 to 20
+            )
+            Text("Changing this recalculates all distances, including past days.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -374,7 +388,7 @@ private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
 // ---------------------------------------------------------------------------- History
 
 @Composable
-fun HistoryScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifier) {
+fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val first = counts.keys.mapNotNull { runCatching { LocalDate.parse(it) }.getOrNull() }.minOrNull() ?: today
     val days = remember(first, today) { generateSequence(today) { it.minusDays(1) }.takeWhile { !it.isBefore(first) }.toList() }
@@ -388,7 +402,7 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Mod
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatCard("Total", total.toString(), Modifier.weight(1f), Distance.formatKm(Distance.kilometers(total)))
+                StatCard("Total", total.toString(), Modifier.weight(1f), Distance.formatKm(Distance.kilometers(total, cmPerReel)))
                 StatCard("Avg / day", (total / days.size).toString(), Modifier.weight(1f))
                 StatCard("Worst day", worst.toString(), Modifier.weight(1f), worstDate)
             }
@@ -410,7 +424,7 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Mod
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                             Text(
-                                Distance.formatMeters(Distance.meters(c)),
+                                Distance.formatMeters(Distance.meters(c, cmPerReel)),
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
