@@ -21,9 +21,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.time.LocalDate
 
 /**
- * Watches Instagram Reels and counts a reel once it has been watched ~50%.
+ * Watches Instagram Reels and counts a reel once it has been watched ~30%.
  *
  * How a reel is counted:
  *  - The reel on screen is tracked by its position in the pager (index).
@@ -57,6 +58,11 @@ class ReelCounterService : AccessibilityService() {
     private var pseudoIndex = 0
     private var lastIndexWasReal = false
 
+    // Cached playback-progress bar (looking it up is expensive, reading it is cheap)
+    private var progressNode: AccessibilityNodeInfo? = null
+    private var progressSearchAt = 0L
+    private var lastDay = ""
+
     // Reels-screen detection cache
     private var reelsCheckedAt = 0L
     private var reelsCached = false
@@ -76,7 +82,7 @@ class ReelCounterService : AccessibilityService() {
             this, screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED
         )
         scope.launch {
-            combine(ReelRepository.counts, AppSettings.goal, AppSettings.transparency) { _, _, _ -> }
+            combine(ReelRepository.counts, AppSettings.limit, AppSettings.transparency) { _, _, _ -> }
                 .collect { overlay.refresh() }
         }
         scope.launch { AppSettings.overlayEnabled.collect { syncOverlay() } }
@@ -105,10 +111,17 @@ class ReelCounterService : AccessibilityService() {
     private fun onScroll(event: AccessibilityEvent) {
         setForeground(true)
         if (!isInReels()) { resetTracking(); return }
-        if (!looksLikeReelPager(event.source)) return
 
         val now = SystemClock.uptimeMillis()
-        val index = resolveIndex(event, now)
+        val realIndex = if (event.fromIndex >= 0 && event.itemCount > 0) event.fromIndex else -1
+
+        // Cheap path: nearly every scroll event (one per few pixels of a swipe) is for the reel we
+        // already track, so skip the expensive checks below.
+        if (realIndex >= 0 && realIndex == currentIndex) { lastScrollAt = now; return }
+        if (!looksLikeReelPager(event.source)) return
+
+        lastIndexWasReal = realIndex >= 0
+        val index = if (realIndex >= 0) realIndex else nextGestureIndex(event, now)
         lastScrollAt = now
 
         when {
@@ -126,13 +139,8 @@ class ReelCounterService : AccessibilityService() {
         }
     }
 
-    /** Real pager position when Instagram reports it, otherwise a counter driven by swipe gestures. */
-    private fun resolveIndex(event: AccessibilityEvent, now: Long): Int {
-        if (event.fromIndex >= 0 && event.itemCount > 0) {
-            lastIndexWasReal = true
-            return event.fromIndex
-        }
-        lastIndexWasReal = false
+    /** Fallback when Instagram reports no pager position: one step per swipe gesture, direction if known. */
+    private fun nextGestureIndex(event: AccessibilityEvent, now: Long): Int {
         if (now - lastScrollAt > GESTURE_GAP_MS) {
             val backwards = Build.VERSION.SDK_INT >= 28 && event.scrollDeltaY < 0
             pseudoIndex += if (backwards) -1 else 1
@@ -161,6 +169,8 @@ class ReelCounterService : AccessibilityService() {
         currentCounted = index != UNKNOWN && index in countedIndices
         maxFraction = 0f
         progressSeen = false
+        progressNode = null
+        progressSearchAt = 0L
     }
 
     private fun resetTracking() {
@@ -169,10 +179,13 @@ class ReelCounterService : AccessibilityService() {
         currentCounted = false
         maxFraction = 0f
         progressSeen = false
+        progressNode = null
     }
 
     private fun tick() {
         if (!igForeground) return
+        val day = LocalDate.now().toString()
+        if (day != lastDay) { lastDay = day; overlay.refresh() }   // new day: popup goes back to 0
         if (!isInReels()) { resetTracking(); return }
         val now = SystemClock.uptimeMillis()
         if (currentIndex == NONE) {
@@ -185,7 +198,7 @@ class ReelCounterService : AccessibilityService() {
         val dwell = now - currentSince
         if (dwell < MIN_DWELL_MS) return
 
-        readProgress()?.let { f ->
+        readProgress(now)?.let { f ->
             if (f > 0f) { progressSeen = true; if (f > maxFraction) maxFraction = f }
         }
         val watchedEnough = if (progressSeen) maxFraction >= WATCH_FRACTION
@@ -199,7 +212,22 @@ class ReelCounterService : AccessibilityService() {
     }
 
     /** Playback progress (0..1) if Instagram exposes its thin progress bar to accessibility, else null. */
-    private fun readProgress(): Float? {
+    private fun readProgress(now: Long): Float? {
+        var node = progressNode
+        if (node != null && !(node.refresh() && node.isVisibleToUser)) { node = null; progressNode = null }
+        if (node == null) {
+            if (now - progressSearchAt < PROGRESS_SEARCH_INTERVAL_MS) return null
+            progressSearchAt = now
+            node = findProgressNode() ?: return null
+            progressNode = node
+        }
+        val info = (node ?: return null).rangeInfo ?: return null
+        if (info.max <= info.min) return null
+        return ((info.current - info.min) / (info.max - info.min)).coerceIn(0f, 1f)
+    }
+
+    /** A wide, thin range-type node in the lower half of the Instagram window. */
+    private fun findProgressNode(): AccessibilityNodeInfo? {
         val root = rootInActiveWindow ?: return null
         if (root.packageName?.toString() != INSTAGRAM) return null
         val dm = resources.displayMetrics
@@ -211,12 +239,10 @@ class ReelCounterService : AccessibilityService() {
             val node = queue.removeFirst()
             visited++
             val info = node.rangeInfo
-            if (info != null && info.max > info.min) {
+            if (info != null && info.max > info.min && node.isVisibleToUser) {
                 node.getBoundsInScreen(r)
-                val wideThinBarInLowerHalf = r.width() >= dm.widthPixels * 0.6f &&
-                        r.height() <= 48 * dm.density && r.top >= dm.heightPixels * 0.5f
-                if (wideThinBarInLowerHalf) {
-                    return ((info.current - info.min) / (info.max - info.min)).coerceIn(0f, 1f)
+                if (r.width() >= dm.widthPixels * 0.6f && r.height() <= 48 * dm.density && r.top >= dm.heightPixels * 0.5f) {
+                    return node
                 }
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
@@ -276,11 +302,12 @@ class ReelCounterService : AccessibilityService() {
         /** View ids that exist only inside the full-screen reels viewer. */
         private val VIEWER_IDS = listOf("clips_viewer_view_pager")
 
-        private const val WATCH_FRACTION = 0.5f          // "watched 50% or more"
+        private const val WATCH_FRACTION = 0.3f          // "watched 30% or more"
         private const val MIN_DWELL_MS = 1000L           // ignore progress readings right after a swipe
         private const val TICK_MS = 400L
         private const val SESSION_TIMEOUT_MS = 120_000L  // forget "already counted" after 2 min away
-        private const val MAX_NODES = 400
+        private const val MAX_NODES = 250
+        private const val PROGRESS_SEARCH_INTERVAL_MS = 1500L
         private const val MIN_HEIGHT_RATIO = 0.6f
         private const val MIN_WIDTH_RATIO = 0.8f
         private const val GESTURE_GAP_MS = 700L

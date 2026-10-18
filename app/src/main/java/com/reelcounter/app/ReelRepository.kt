@@ -39,19 +39,19 @@ object ReelRepository {
 
 /** User settings + remembered position of the floating counter. */
 object AppSettings {
-    const val DEFAULT_GOAL = 100
-    const val MAX_TRANSPARENCY = 0.8f
+    const val DEFAULT_LIMIT = 100
+    const val MAX_TRANSPARENCY = 1f
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
-    private val _goal = MutableStateFlow(DEFAULT_GOAL)
+    private val _limit = MutableStateFlow(DEFAULT_LIMIT)
     private val _transparency = MutableStateFlow(0.2f)
-    private val _fallbackSeconds = MutableStateFlow(8)
+    private val _fallbackSeconds = MutableStateFlow(3)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
-    /** Daily goal; the popup turns red once today's count is above it. */
-    val goal: StateFlow<Int> = _goal.asStateFlow()
-    /** 0 = solid popup, up to MAX_TRANSPARENCY = mostly see-through. */
+    /** Daily limit; the popup turns red once today's count is above it. */
+    val limit: StateFlow<Int> = _limit.asStateFlow()
+    /** Transparency of the popup's dark background only (0 = solid, 1 = invisible). The number stays opaque. */
     val transparency: StateFlow<Float> = _transparency.asStateFlow()
     /** Used only when Instagram doesn't expose playback progress: a reel counts after this long. */
     val fallbackSeconds: StateFlow<Int> = _fallbackSeconds.asStateFlow()
@@ -61,9 +61,9 @@ object AppSettings {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
         _overlayEnabled.value = prefs.getBoolean("overlay", true)
-        _goal.value = prefs.getInt("goal", DEFAULT_GOAL)
-        _transparency.value = prefs.getFloat("transparency", 0.2f)
-        _fallbackSeconds.value = prefs.getInt("fallback_seconds", 8)
+        _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
+        _transparency.value = prefs.getFloat("transparency", 0.2f).coerceIn(0f, MAX_TRANSPARENCY)
+        _fallbackSeconds.value = prefs.getInt("fallback_seconds", 3)
     }
 
     fun setOverlayEnabled(enabled: Boolean) {
@@ -71,20 +71,23 @@ object AppSettings {
         _overlayEnabled.value = enabled
     }
 
-    fun setGoal(value: Int) {
+    fun setLimit(value: Int) {
         val v = value.coerceIn(1, 99_999)
-        prefs.edit().putInt("goal", v).apply()
-        _goal.value = v
+        prefs.edit().putInt("limit", v).apply()
+        _limit.value = v
     }
 
+    /** Live update while the slider moves; call [persistTransparency] when the finger lifts. */
     fun setTransparency(value: Float) {
-        val v = value.coerceIn(0f, MAX_TRANSPARENCY)
-        prefs.edit().putFloat("transparency", v).apply()
-        _transparency.value = v
+        _transparency.value = value.coerceIn(0f, MAX_TRANSPARENCY)
+    }
+
+    fun persistTransparency() {
+        prefs.edit().putFloat("transparency", _transparency.value).apply()
     }
 
     fun setFallbackSeconds(value: Int) {
-        val v = value.coerceIn(3, 30)
+        val v = value.coerceIn(1, 30)
         prefs.edit().putInt("fallback_seconds", v).apply()
         _fallbackSeconds.value = v
     }

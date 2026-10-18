@@ -25,9 +25,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -37,6 +37,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.reelcounter.app.AppSettings
+import com.reelcounter.app.Distance
 import com.reelcounter.app.ReelCounterService
 import com.reelcounter.app.ReelRepository
 import kotlinx.coroutines.delay
@@ -47,7 +48,10 @@ import java.util.Locale
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private val OverGoalRed = Color(0xFFFF4D4D)
+private val OverLimitRed = Color(0xFFFF4D4D)
+private val DATE_LONG: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, d MMMM")
+private val DATE_SHORT: DateTimeFormatter = DateTimeFormatter.ofPattern("EEE, d MMM")
+private val DATE_DAY_MONTH: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM")
 
 @Composable
 fun ReelCounterTheme(content: @Composable () -> Unit) {
@@ -67,7 +71,7 @@ fun AppRoot() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
     val counts by ReelRepository.counts.collectAsStateWithLifecycle()
-    val goal by AppSettings.goal.collectAsStateWithLifecycle()
+    val limit by AppSettings.limit.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -95,8 +99,8 @@ fun AppRoot() {
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(counts, goal, Modifier.padding(padding))
-        else HistoryScreen(counts, goal, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, limit, Modifier.padding(padding))
+        else HistoryScreen(counts, limit, Modifier.padding(padding))
     }
 
     if (confirmClear) {
@@ -115,9 +119,10 @@ fun AppRoot() {
 // ---------------------------------------------------------------------------- Home
 
 @Composable
-fun HomeScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modifier) {
+fun HomeScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
+    val totalReels = remember(counts) { counts.values.sum() }
     val serviceOn by rememberServiceEnabled()
 
     Column(
@@ -125,37 +130,38 @@ fun HomeScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modifie
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
-        TodayCard(todayCount, goal, today)
-        WeekCard(counts, goal, today)
-        PopupCard(todayCount, goal)
+        TodayCard(todayCount, limit, today)
+        LimitCard(limit)
+        DistanceCard(todayCount, totalReels)
+        WeekCard(counts, limit, today)
+        PopupCard(todayCount, limit)
         WatchRuleCard()
     }
 }
 
 @Composable
-private fun TodayCard(count: Int, goal: Int, today: LocalDate) {
-    var editGoal by remember { mutableStateOf(false) }
-    val over = count > goal
-    val numberColor = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurface
+private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
+    val over = count > limit
+    val numberColor = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(today.format(DateTimeFormatter.ofPattern("EEEE, d MMMM")), style = MaterialTheme.typography.labelLarge)
+            Text(today.format(DATE_LONG), style = MaterialTheme.typography.labelLarge)
             Text(count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold, color = numberColor)
             Text("reels watched today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
-                progress = { min(1f, count.toFloat() / goal) },
-                color = if (over) OverGoalRed else MaterialTheme.colorScheme.primary,
+                progress = { min(1f, count.toFloat() / limit) },
+                color = if (over) OverLimitRed else MaterialTheme.colorScheme.primary,
                 modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp))
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (over) "Over your goal of $goal by ${count - goal}" else "Goal $goal  ·  ${goal - count} to go",
+                if (over) "Over your daily limit of $limit by ${count - limit}" else "Daily limit $limit  ·  ${limit - count} left",
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurfaceVariant
+                color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurfaceVariant
             )
-            TextButton(onClick = { editGoal = true }) { Text("Change goal") }
+            Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Fix count", style = MaterialTheme.typography.labelMedium)
                 OutlinedButton(onClick = { ReelRepository.adjustToday(-1) }, enabled = count > 0) { Text("−1") }
@@ -163,12 +169,34 @@ private fun TodayCard(count: Int, goal: Int, today: LocalDate) {
             }
         }
     }
+}
 
-    if (editGoal) {
-        var text by remember { mutableStateOf(goal.toString()) }
+@Composable
+private fun LimitCard(limit: Int) {
+    var edit by remember { mutableStateOf(false) }
+
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Daily limit", style = MaterialTheme.typography.titleMedium)
+                    Text("The popup turns red when you go over", style = MaterialTheme.typography.bodySmall)
+                }
+                Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { AppSettings.setLimit(limit - 10) }, enabled = limit > 1, modifier = Modifier.weight(1f)) { Text("−10") }
+                Button(onClick = { edit = true }, modifier = Modifier.weight(2f)) { Text("Set limit") }
+                OutlinedButton(onClick = { AppSettings.setLimit(limit + 10) }, modifier = Modifier.weight(1f)) { Text("+10") }
+            }
+        }
+    }
+
+    if (edit) {
+        var text by remember { mutableStateOf(limit.toString()) }
         AlertDialog(
-            onDismissRequest = { editGoal = false },
-            title = { Text("Daily reel goal") },
+            onDismissRequest = { edit = false },
+            title = { Text("Daily reel limit") },
             text = {
                 OutlinedTextField(
                     value = text,
@@ -180,19 +208,46 @@ private fun TodayCard(count: Int, goal: Int, today: LocalDate) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    text.toIntOrNull()?.let { AppSettings.setGoal(it) }
-                    editGoal = false
+                    text.toIntOrNull()?.let { AppSettings.setLimit(it) }
+                    edit = false
                 }) { Text("Save") }
             },
             dismissButton = {
-                TextButton(onClick = { AppSettings.setGoal(AppSettings.DEFAULT_GOAL); editGoal = false }) { Text("Reset to ${AppSettings.DEFAULT_GOAL}") }
+                TextButton(onClick = { AppSettings.setLimit(AppSettings.DEFAULT_LIMIT); edit = false }) { Text("Reset to ${AppSettings.DEFAULT_LIMIT}") }
             }
         )
     }
 }
 
 @Composable
-private fun PopupCard(count: Int, goal: Int) {
+private fun DistanceCard(todayReels: Int, totalReels: Int) {
+    val fact = remember(totalReels) { Distance.funFact(totalReels) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Distance scrolled", style = MaterialTheme.typography.titleMedium)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                DistanceStat("Today", Distance.formatMeters(Distance.meters(todayReels)), Modifier.weight(1f))
+                DistanceStat("All time", Distance.formatKm(Distance.kilometers(totalReels)), Modifier.weight(1f))
+            }
+            Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            fact.next?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text("Based on ${Distance.CM_PER_REEL.toInt()} cm of scrolling per reel", style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+@Composable
+private fun DistanceStat(title: String, value: String, modifier: Modifier) {
+    Column(modifier) {
+        Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(title, style = MaterialTheme.typography.labelMedium)
+    }
+}
+
+@Composable
+private fun PopupCard(count: Int, limit: Int) {
     val overlayOn by AppSettings.overlayEnabled.collectAsStateWithLifecycle()
     val transparency by AppSettings.transparency.collectAsStateWithLifecycle()
 
@@ -205,21 +260,31 @@ private fun PopupCard(count: Int, goal: Int) {
                 }
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-                // Live preview of how the popup will look
+            Text("Background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
+            // Live preview over a mid-tone backdrop, to show how the popup reads on top of video
+            Box(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF7C8594)).padding(12.dp),
+                contentAlignment = Alignment.Center
+            ) {
                 Box(
-                    Modifier.alpha(1f - transparency).clip(RoundedCornerShape(50)).background(Color(0xFF111111))
+                    Modifier.clip(RoundedCornerShape(50)).background(Color(0xFF111111).copy(alpha = 1f - transparency))
                         .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
-                    Text("▶ $count", color = if (count > goal) OverGoalRed else Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "▶ $count",
+                        color = if (count > limit) OverLimitRed else Color.White,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelLarge.copy(shadow = Shadow(Color.Black, blurRadius = 6f))
+                    )
                 }
             }
             Slider(
                 value = transparency,
                 onValueChange = { AppSettings.setTransparency(it) },
+                onValueChangeFinished = { AppSettings.persistTransparency() },
                 valueRange = 0f..AppSettings.MAX_TRANSPARENCY
             )
+            Text("Only the dark background fades; the number stays solid.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -231,7 +296,7 @@ private fun WatchRuleCard() {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("What counts as a reel", style = MaterialTheme.typography.titleMedium)
             Text(
-                "A reel counts once you've watched about half of it. Going back up and down again never counts the same reel twice.",
+                "A reel counts once you've watched about 30% of it. Going back up and down again never counts the same reel twice.",
                 style = MaterialTheme.typography.bodySmall
             )
             Text(
@@ -239,7 +304,7 @@ private fun WatchRuleCard() {
                 style = MaterialTheme.typography.bodySmall
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds - 1) }, enabled = seconds > 3) { Text("−") }
+                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
                 Text("$seconds s", style = MaterialTheme.typography.titleMedium)
                 OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
             }
@@ -277,7 +342,7 @@ private fun SetupCard() {
 }
 
 @Composable
-private fun WeekCard(counts: Map<String, Int>, goal: Int, today: LocalDate) {
+private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
     val days = (6 downTo 0).map { today.minusDays(it.toLong()) }
     val values = days.map { counts[it.toString()] ?: 0 }
     val max = values.max().coerceAtLeast(1)
@@ -286,7 +351,7 @@ private fun WeekCard(counts: Map<String, Int>, goal: Int, today: LocalDate) {
             Text("Last 7 days", style = MaterialTheme.typography.titleMedium)
             Row(Modifier.fillMaxWidth().height(130.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 days.forEachIndexed { i, d ->
-                    val barColor = if (values[i] > goal) OverGoalRed else MaterialTheme.colorScheme.primary
+                    val barColor = if (values[i] > limit) OverLimitRed else MaterialTheme.colorScheme.primary
                     Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
                         Text(values[i].toString(), style = MaterialTheme.typography.labelSmall)
                         Spacer(Modifier.height(2.dp))
@@ -301,7 +366,7 @@ private fun WeekCard(counts: Map<String, Int>, goal: Int, today: LocalDate) {
                 }
             }
             val total = values.sum()
-            Text("Week total $total  ·  avg ${total / 7} per day  ·  red = over goal", style = MaterialTheme.typography.bodySmall)
+            Text("Week total $total  ·  avg ${total / 7} per day  ·  red = over limit", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -309,20 +374,23 @@ private fun WeekCard(counts: Map<String, Int>, goal: Int, today: LocalDate) {
 // ---------------------------------------------------------------------------- History
 
 @Composable
-fun HistoryScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modifier) {
+fun HistoryScreen(counts: Map<String, Int>, limit: Int, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val first = counts.keys.mapNotNull { runCatching { LocalDate.parse(it) }.getOrNull() }.minOrNull() ?: today
-    val days = generateSequence(today) { it.minusDays(1) }.takeWhile { !it.isBefore(first) }.toList()
+    val days = remember(first, today) { generateSequence(today) { it.minusDays(1) }.takeWhile { !it.isBefore(first) }.toList() }
     val total = counts.values.sum()
-    val best = counts.values.maxOrNull() ?: 0
-    val barMax = best.coerceAtLeast(1)
+    val worst = counts.values.maxOrNull() ?: 0
+    val barMax = worst.coerceAtLeast(1)
+    val worstDate = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }?.key?.let {
+        runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull()
+    }
 
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatCard("Total", total.toString(), Modifier.weight(1f))
+                StatCard("Total", total.toString(), Modifier.weight(1f), Distance.formatKm(Distance.kilometers(total)))
                 StatCard("Avg / day", (total / days.size).toString(), Modifier.weight(1f))
-                StatCard("Best day", best.toString(), Modifier.weight(1f))
+                StatCard("Worst day", worst.toString(), Modifier.weight(1f), worstDate)
             }
         }
         if (total == 0) item {
@@ -330,26 +398,33 @@ fun HistoryScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modi
         }
         items(days, key = { it.toString() }) { d ->
             val c = counts[d.toString()] ?: 0
-            val over = c > goal
+            val over = c > limit
             val label = when (d) {
                 today -> "Today"
                 today.minusDays(1) -> "Yesterday"
-                else -> d.format(DateTimeFormatter.ofPattern("EEE, d MMM"))
+                else -> d.format(DATE_SHORT)
             }
             Card(Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(label, style = MaterialTheme.typography.bodyLarge)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                            Text(
+                                Distance.formatMeters(Distance.meters(c)),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                         LinearProgressIndicator(
                             progress = { c.toFloat() / barMax },
-                            color = if (over) OverGoalRed else MaterialTheme.colorScheme.primary,
+                            color = if (over) OverLimitRed else MaterialTheme.colorScheme.primary,
                             modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp))
                         )
                     }
                     Spacer(Modifier.width(16.dp))
                     Text(
                         c.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
-                        color = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurface
+                        color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
                     )
                 }
             }
@@ -358,11 +433,12 @@ fun HistoryScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modi
 }
 
 @Composable
-private fun StatCard(title: String, value: String, modifier: Modifier) {
+private fun StatCard(title: String, value: String, modifier: Modifier, subtitle: String? = null) {
     Card(modifier) {
         Column(Modifier.padding(12.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Text(title, style = MaterialTheme.typography.labelMedium)
+            if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.labelSmall)
         }
     }
 }
