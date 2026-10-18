@@ -31,8 +31,8 @@ class ReelOverlay(private val service: AccessibilityService) {
         PixelFormat.TRANSLUCENT
     ).apply { gravity = Gravity.TOP or Gravity.START }
 
-    fun show(count: Int) {
-        if (label != null) { update(count); return }
+    fun show() {
+        if (label != null) { refresh(); return }
         params.x = AppSettings.overlayX
         params.y = AppSettings.overlayY
         val view = createView()
@@ -40,7 +40,7 @@ class ReelOverlay(private val service: AccessibilityService) {
             wm.addView(view, params)
             label = view
             lastCount = -1
-            update(count)
+            refresh()
         } catch (_: Exception) {
             label = null
         }
@@ -52,9 +52,13 @@ class ReelOverlay(private val service: AccessibilityService) {
         label = null
     }
 
-    fun update(count: Int) {
+    /** Re-reads count, goal and transparency. Text turns red once the count is above the goal. */
+    fun refresh() {
         val view = label ?: return
+        val count = ReelRepository.todayCount()
         view.text = "▶ $count"
+        view.setTextColor(if (count > AppSettings.goal.value) OVER_GOAL_RED else Color.WHITE)
+        view.alpha = 1f - AppSettings.transparency.value
         if (lastCount in 0 until count) {
             view.animate().scaleX(1.25f).scaleY(1.25f).setDuration(90).withEndAction {
                 view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
@@ -73,7 +77,7 @@ class ReelOverlay(private val service: AccessibilityService) {
         setPadding(h, v, h, v)
         background = GradientDrawable().apply {
             cornerRadius = 100 * density
-            setColor(0xCC111111.toInt())
+            setColor(0xFF111111.toInt())
         }
 
         var startX = 0; var startY = 0; var downX = 0f; var downY = 0f
@@ -97,5 +101,9 @@ class ReelOverlay(private val service: AccessibilityService) {
                 else -> false
             }
         }
+    }
+
+    private companion object {
+        const val OVER_GOAL_RED = 0xFFFF4D4D.toInt()
     }
 }

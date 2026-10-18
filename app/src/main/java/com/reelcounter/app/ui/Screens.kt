@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DateRange
@@ -24,9 +25,12 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -40,6 +44,10 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+private val OverGoalRed = Color(0xFFFF4D4D)
 
 @Composable
 fun ReelCounterTheme(content: @Composable () -> Unit) {
@@ -59,6 +67,7 @@ fun AppRoot() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
     val counts by ReelRepository.counts.collectAsStateWithLifecycle()
+    val goal by AppSettings.goal.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -86,7 +95,8 @@ fun AppRoot() {
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(counts, Modifier.padding(padding)) else HistoryScreen(counts, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, goal, Modifier.padding(padding))
+        else HistoryScreen(counts, goal, Modifier.padding(padding))
     }
 
     if (confirmClear) {
@@ -105,41 +115,133 @@ fun AppRoot() {
 // ---------------------------------------------------------------------------- Home
 
 @Composable
-fun HomeScreen(counts: Map<String, Int>, modifier: Modifier = Modifier) {
+fun HomeScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val serviceOn by rememberServiceEnabled()
-    val overlayOn by AppSettings.overlayEnabled.collectAsStateWithLifecycle()
 
     Column(
         modifier.verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
+        TodayCard(todayCount, goal, today)
+        WeekCard(counts, goal, today)
+        PopupCard(todayCount, goal)
+        WatchRuleCard()
+    }
+}
 
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(today.format(DateTimeFormatter.ofPattern("EEEE, d MMMM")), style = MaterialTheme.typography.labelLarge)
-                Text(todayCount.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold)
-                Text("reels scrolled today", style = MaterialTheme.typography.bodyLarge)
-                Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Fix count", style = MaterialTheme.typography.labelMedium)
-                    OutlinedButton(onClick = { ReelRepository.adjustToday(-1) }, enabled = todayCount > 0) { Text("−1") }
-                    OutlinedButton(onClick = { ReelRepository.adjustToday(1) }) { Text("+1") }
-                }
+@Composable
+private fun TodayCard(count: Int, goal: Int, today: LocalDate) {
+    var editGoal by remember { mutableStateOf(false) }
+    val over = count > goal
+    val numberColor = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurface
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(today.format(DateTimeFormatter.ofPattern("EEEE, d MMMM")), style = MaterialTheme.typography.labelLarge)
+            Text(count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold, color = numberColor)
+            Text("reels watched today", style = MaterialTheme.typography.bodyLarge)
+            Spacer(Modifier.height(12.dp))
+            LinearProgressIndicator(
+                progress = { min(1f, count.toFloat() / goal) },
+                color = if (over) OverGoalRed else MaterialTheme.colorScheme.primary,
+                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp))
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (over) "Over your goal of $goal by ${count - goal}" else "Goal $goal  ·  ${goal - count} to go",
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            TextButton(onClick = { editGoal = true }) { Text("Change goal") }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Fix count", style = MaterialTheme.typography.labelMedium)
+                OutlinedButton(onClick = { ReelRepository.adjustToday(-1) }, enabled = count > 0) { Text("−1") }
+                OutlinedButton(onClick = { ReelRepository.adjustToday(1) }) { Text("+1") }
             }
         }
+    }
 
-        WeekCard(counts, today)
+    if (editGoal) {
+        var text by remember { mutableStateOf(goal.toString()) }
+        AlertDialog(
+            onDismissRequest = { editGoal = false },
+            title = { Text("Daily reel goal") },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter(Char::isDigit).take(5) },
+                    label = { Text("Reels per day") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    text.toIntOrNull()?.let { AppSettings.setGoal(it) }
+                    editGoal = false
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { AppSettings.setGoal(AppSettings.DEFAULT_GOAL); editGoal = false }) { Text("Reset to ${AppSettings.DEFAULT_GOAL}") }
+            }
+        )
+    }
+}
 
-        Card(Modifier.fillMaxWidth()) {
-            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+@Composable
+private fun PopupCard(count: Int, goal: Int) {
+    val overlayOn by AppSettings.overlayEnabled.collectAsStateWithLifecycle()
+    val transparency by AppSettings.transparency.collectAsStateWithLifecycle()
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Floating counter", style = MaterialTheme.typography.titleMedium)
                     Text("Small draggable popup while you're in Instagram", style = MaterialTheme.typography.bodySmall)
                 }
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                // Live preview of how the popup will look
+                Box(
+                    Modifier.alpha(1f - transparency).clip(RoundedCornerShape(50)).background(Color(0xFF111111))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Text("▶ $count", color = if (count > goal) OverGoalRed else Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+            Slider(
+                value = transparency,
+                onValueChange = { AppSettings.setTransparency(it) },
+                valueRange = 0f..AppSettings.MAX_TRANSPARENCY
+            )
+        }
+    }
+}
+
+@Composable
+private fun WatchRuleCard() {
+    val seconds by AppSettings.fallbackSeconds.collectAsStateWithLifecycle()
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("What counts as a reel", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "A reel counts once you've watched about half of it. Going back up and down again never counts the same reel twice.",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                "If your Instagram version doesn't share playback progress, a reel counts after this many seconds on it instead:",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds - 1) }, enabled = seconds > 3) { Text("−") }
+                Text("$seconds s", style = MaterialTheme.typography.titleMedium)
+                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
             }
         }
     }
@@ -155,7 +257,7 @@ private fun SetupCard() {
                 Text("Turn on the counter", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                "Enable Reel Counter under Accessibility → Installed apps so it can notice when you swipe to the next reel in Instagram. Everything stays on your phone.",
+                "Enable Reel Counter under Accessibility → Installed apps so it can notice which reel you're watching in Instagram. Everything stays on your phone.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
@@ -175,7 +277,7 @@ private fun SetupCard() {
 }
 
 @Composable
-private fun WeekCard(counts: Map<String, Int>, today: LocalDate) {
+private fun WeekCard(counts: Map<String, Int>, goal: Int, today: LocalDate) {
     val days = (6 downTo 0).map { today.minusDays(it.toLong()) }
     val values = days.map { counts[it.toString()] ?: 0 }
     val max = values.max().coerceAtLeast(1)
@@ -184,13 +286,14 @@ private fun WeekCard(counts: Map<String, Int>, today: LocalDate) {
             Text("Last 7 days", style = MaterialTheme.typography.titleMedium)
             Row(Modifier.fillMaxWidth().height(130.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 days.forEachIndexed { i, d ->
+                    val barColor = if (values[i] > goal) OverGoalRed else MaterialTheme.colorScheme.primary
                     Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
                         Text(values[i].toString(), style = MaterialTheme.typography.labelSmall)
                         Spacer(Modifier.height(2.dp))
                         Box(
                             Modifier.fillMaxWidth().height((80f * values[i] / max).coerceAtLeast(3f).dp)
                                 .clip(RoundedCornerShape(6.dp))
-                                .background(MaterialTheme.colorScheme.primary.copy(alpha = if (i == 6) 1f else 0.45f))
+                                .background(barColor.copy(alpha = if (i == 6) 1f else 0.5f))
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(d.dayOfWeek.getDisplayName(TextStyle.NARROW, Locale.getDefault()), style = MaterialTheme.typography.labelSmall)
@@ -198,7 +301,7 @@ private fun WeekCard(counts: Map<String, Int>, today: LocalDate) {
                 }
             }
             val total = values.sum()
-            Text("Week total $total  ·  avg ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
+            Text("Week total $total  ·  avg ${total / 7} per day  ·  red = over goal", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -206,7 +309,7 @@ private fun WeekCard(counts: Map<String, Int>, today: LocalDate) {
 // ---------------------------------------------------------------------------- History
 
 @Composable
-fun HistoryScreen(counts: Map<String, Int>, modifier: Modifier = Modifier) {
+fun HistoryScreen(counts: Map<String, Int>, goal: Int, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val first = counts.keys.mapNotNull { runCatching { LocalDate.parse(it) }.getOrNull() }.minOrNull() ?: today
     val days = generateSequence(today) { it.minusDays(1) }.takeWhile { !it.isBefore(first) }.toList()
@@ -223,10 +326,11 @@ fun HistoryScreen(counts: Map<String, Int>, modifier: Modifier = Modifier) {
             }
         }
         if (total == 0) item {
-            Text("No reels counted yet. Open Instagram's Reels and start swiping.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 8.dp))
+            Text("No reels counted yet. Open Instagram's Reels and start watching.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 8.dp))
         }
         items(days, key = { it.toString() }) { d ->
             val c = counts[d.toString()] ?: 0
+            val over = c > goal
             val label = when (d) {
                 today -> "Today"
                 today.minusDays(1) -> "Yesterday"
@@ -236,10 +340,17 @@ fun HistoryScreen(counts: Map<String, Int>, modifier: Modifier = Modifier) {
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(label, style = MaterialTheme.typography.bodyLarge)
-                        LinearProgressIndicator(progress = { c.toFloat() / barMax }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)))
+                        LinearProgressIndicator(
+                            progress = { c.toFloat() / barMax },
+                            color = if (over) OverGoalRed else MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp))
+                        )
                     }
                     Spacer(Modifier.width(16.dp))
-                    Text(c.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        c.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
+                        color = if (over) OverGoalRed else MaterialTheme.colorScheme.onSurface
+                    )
                 }
             }
         }
