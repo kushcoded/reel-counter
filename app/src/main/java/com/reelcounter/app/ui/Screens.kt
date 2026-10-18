@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -26,8 +27,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -35,7 +41,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -49,8 +54,11 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private val OverLimitRed = Color(0xFFFF4D4D)
 private val DATE_LONG: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, d MMMM")
@@ -91,10 +99,9 @@ fun AppRoot() {
                         }
                     }
                     IconButton(onClick = { AppSettings.setDarkTheme(!dark) }) {
-                        Text(
-                            if (dark) "☀️" else "🌙",
-                            fontSize = 20.sp,
-                            modifier = Modifier.semantics { contentDescription = if (dark) "Switch to light theme" else "Switch to dark theme" }
+                        ThemeIcon(
+                            dark,
+                            Modifier.semantics { contentDescription = if (dark) "Switch to light theme" else "Switch to dark theme" }
                         )
                     }
                 }
@@ -131,6 +138,27 @@ fun AppRoot() {
 }
 
 // ---------------------------------------------------------------------------- Shared bits
+
+/** Plain black-and-white icon of the current theme: a moon when dark, a sun when light. */
+@Composable
+private fun ThemeIcon(dark: Boolean, modifier: Modifier = Modifier) {
+    val color = if (dark) Color.White else Color.Black
+    Canvas(modifier.size(22.dp)) {
+        val r = size.minDimension / 2
+        if (dark) {
+            val moon = Path().apply { addOval(Rect(center, r * 0.85f)) }
+            val bite = Path().apply { addOval(Rect(Offset(center.x + r * 0.5f, center.y - r * 0.3f), r * 0.75f)) }
+            drawPath(Path.combine(PathOperation.Difference, moon, bite), color)
+        } else {
+            drawCircle(color, radius = r * 0.42f, center = center)
+            for (i in 0 until 8) {
+                val a = i * PI / 4
+                val dir = Offset(cos(a).toFloat(), sin(a).toFloat())
+                drawLine(color, center + dir * (r * 0.68f), center + dir * (r * 0.98f), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+            }
+        }
+    }
+}
 
 /** Small (i) button; the explanation lives in a dialog so cards stay uncluttered. */
 @Composable
@@ -224,11 +252,7 @@ private fun LimitCard(limit: Int) {
             CardTitle("Daily limit", "Your daily reel limit. The floating counter and the chart bars turn red once you go over it.") {
                 Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = { AppSettings.setLimit(limit - 10) }, enabled = limit > 1, modifier = Modifier.weight(1f)) { Text("−10") }
-                Button(onClick = { edit = true }, modifier = Modifier.weight(2f)) { Text("Set limit") }
-                OutlinedButton(onClick = { AppSettings.setLimit(limit + 10) }, modifier = Modifier.weight(1f)) { Text("+10") }
-            }
+            Button(onClick = { edit = true }, modifier = Modifier.fillMaxWidth()) { Text("Set limit") }
         }
     }
 
@@ -433,15 +457,24 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifi
     val dailyAvg = total / activeDays
     val worst = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }
     val barMax = (worst?.value ?: 0).coerceAtLeast(1)
+    val daysOver = counts.count { it.value > limit }
     val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull() } ?: "–"
 
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
-            // Equal-height cards: every card has the same three lines (value, title, detail).
-            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatCard("Total", total.toString(), Distance.formatKm(Distance.kilometers(total, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
-                StatCard("Daily avg", dailyAvg.toString(), Distance.formatMeters(Distance.meters(dailyAvg, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
-                StatCard("Worst day", (worst?.value ?: 0).toString(), worstDate, Modifier.weight(1f).fillMaxHeight())
+            // 2x2 grid; every card has the same three lines (value, title, detail) so heights match.
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StatCard("Total", total.toString(), Distance.formatKm(Distance.kilometers(total, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
+                    StatCard("Daily avg", dailyAvg.toString(), Distance.formatMeters(Distance.meters(dailyAvg, cmPerReel)), Modifier.weight(1f).fillMaxHeight())
+                }
+                Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StatCard("Worst day", (worst?.value ?: 0).toString(), worstDate, Modifier.weight(1f).fillMaxHeight())
+                    StatCard(
+                        "Days over limit", daysOver.toString(), "of $activeDays days", Modifier.weight(1f).fillMaxHeight(),
+                        valueColor = if (daysOver > 0) OverLimitRed else MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
         }
         if (total == 0) {
@@ -492,10 +525,13 @@ fun HistoryScreen(counts: Map<String, Int>, limit: Int, cmPerReel: Float, modifi
 }
 
 @Composable
-private fun StatCard(title: String, value: String, detail: String, modifier: Modifier) {
+private fun StatCard(
+    title: String, value: String, detail: String, modifier: Modifier,
+    valueColor: Color = MaterialTheme.colorScheme.onSurface
+) {
     Card(modifier) {
         Column(Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = valueColor, maxLines = 1)
             Text(title, style = MaterialTheme.typography.labelMedium, maxLines = 1)
             Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
         }

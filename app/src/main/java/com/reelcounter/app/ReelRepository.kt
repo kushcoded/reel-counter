@@ -41,6 +41,7 @@ object ReelRepository {
 object AppSettings {
     const val DEFAULT_LIMIT = 100
     const val MAX_TRANSPARENCY = 1f
+    const val DEFAULT_TRANSPARENCY = 0.5f
     const val DEFAULT_CM_PER_REEL = 13.5f
     const val MIN_CM_PER_REEL = 10f
     const val MAX_CM_PER_REEL = 17f
@@ -48,7 +49,7 @@ object AppSettings {
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
     private val _limit = MutableStateFlow(DEFAULT_LIMIT)
-    private val _transparency = MutableStateFlow(0.2f)
+    private val _transparency = MutableStateFlow(DEFAULT_TRANSPARENCY)
     private val _fallbackSeconds = MutableStateFlow(3)
     private val _cmPerReel = MutableStateFlow(DEFAULT_CM_PER_REEL)
     private val _darkTheme = MutableStateFlow(true)
@@ -71,7 +72,7 @@ object AppSettings {
         prefs = context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
         _overlayEnabled.value = prefs.getBoolean("overlay", true)
         _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
-        _transparency.value = prefs.getFloat("transparency", 0.2f).coerceIn(0f, MAX_TRANSPARENCY)
+        _transparency.value = prefs.getFloat("transparency", DEFAULT_TRANSPARENCY).coerceIn(0f, MAX_TRANSPARENCY)
         _fallbackSeconds.value = prefs.getInt("fallback_seconds", 3)
         _darkTheme.value = prefs.getBoolean("dark_theme", true)
         _cmPerReel.value = prefs.getFloat("cm_per_reel", DEFAULT_CM_PER_REEL).coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
