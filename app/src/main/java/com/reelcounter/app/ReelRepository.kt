@@ -60,21 +60,16 @@ class CountStore(private val countsFile: String, private val watchFile: String) 
 }
 
 object ReelRepository {
-    // Instagram keeps the original file names, so existing installs keep their history.
-    val reels = CountStore("reel_counts", "watch_time")
-    val shorts = CountStore("short_counts", "short_watch_time")
+    /** Reels and Shorts are merged into one store (1 short = 1 reel). Original file names keep existing history. */
+    val store = CountStore("reel_counts", "watch_time")
 
-    fun init(context: Context) {
-        reels.init(context)
-        shorts.init(context)
-    }
-
-    fun store(platform: Platform): CountStore = if (platform == Platform.Shorts) shorts else reels
+    fun init(context: Context) = store.init(context)
 }
 
 /** User settings + remembered position of the floating counter. */
 object AppSettings {
     const val DEFAULT_LIMIT = 100
+    const val DEFAULT_SECONDS = 3
     const val MAX_TRANSPARENCY = 1f
     const val DEFAULT_TRANSPARENCY = 0.5f
     const val DEFAULT_CM_PER_REEL = 13.5f
@@ -83,53 +78,63 @@ object AppSettings {
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
-    private val _limitReels = MutableStateFlow(DEFAULT_LIMIT)
-    private val _limitShorts = MutableStateFlow(DEFAULT_LIMIT)
+    private val _limit = MutableStateFlow(DEFAULT_LIMIT)
+    private val _seconds = MutableStateFlow(DEFAULT_SECONDS)
     private val _transparency = MutableStateFlow(DEFAULT_TRANSPARENCY)
     private val _cmPerReel = MutableStateFlow(DEFAULT_CM_PER_REEL)
     private val _darkTheme = MutableStateFlow(true)
-    private val _platform = MutableStateFlow(Platform.Reels)
+    private val _trackReels = MutableStateFlow(true)
+    private val _trackShorts = MutableStateFlow(true)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
+    /** Daily limit (reels + shorts together); the popup turns red once today's count is above it. */
+    val limit: StateFlow<Int> = _limit.asStateFlow()
+    /** A reel/short counts once you have stayed on it this many seconds. */
+    val seconds: StateFlow<Int> = _seconds.asStateFlow()
     /** Transparency of the popup's dark background only (0 = solid, 1 = invisible). The number stays opaque. */
     val transparency: StateFlow<Float> = _transparency.asStateFlow()
     /** Thumb travel per reel/short, in cm; drives every distance figure. */
     val cmPerReel: StateFlow<Float> = _cmPerReel.asStateFlow()
     /** App theme; dark by default. */
     val darkTheme: StateFlow<Boolean> = _darkTheme.asStateFlow()
-    /** Which feed the app screens are showing. */
-    val platform: StateFlow<Platform> = _platform.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
         _overlayEnabled.value = prefs.getBoolean("overlay", true)
-        _limitReels.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
-        _limitShorts.value = prefs.getInt("limit_shorts", DEFAULT_LIMIT)
+        _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
+        _seconds.value = prefs.getInt("fallback_seconds", DEFAULT_SECONDS).coerceIn(1, 30)
         _transparency.value = prefs.getFloat("transparency", DEFAULT_TRANSPARENCY).coerceIn(0f, MAX_TRANSPARENCY)
         _cmPerReel.value = prefs.getFloat("cm_per_reel", DEFAULT_CM_PER_REEL).coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
         _darkTheme.value = prefs.getBoolean("dark_theme", true)
-        _platform.value = Platform.entries.firstOrNull { it.name == prefs.getString("platform", null) } ?: Platform.Reels
+        _trackReels.value = prefs.getBoolean("track_reels", true)
+        _trackShorts.value = prefs.getBoolean("track_shorts", true)
     }
 
-    /** Daily limit for a feed; the popup turns red once that feed's count is above it. */
-    fun limit(platform: Platform): StateFlow<Int> = if (platform == Platform.Shorts) _limitShorts else _limitReels
+    /** Is counting switched on for this app? Off means the service ignores that app completely. */
+    fun tracking(platform: Platform): StateFlow<Boolean> = if (platform == Platform.Shorts) _trackShorts else _trackReels
 
-    fun setLimit(platform: Platform, value: Int) {
-        val v = value.coerceIn(1, 99_999)
+    fun setTracking(platform: Platform, on: Boolean) {
         if (platform == Platform.Shorts) {
-            prefs.edit().putInt("limit_shorts", v).apply()
-            _limitShorts.value = v
+            prefs.edit().putBoolean("track_shorts", on).apply()
+            _trackShorts.value = on
         } else {
-            prefs.edit().putInt("limit", v).apply()
-            _limitReels.value = v
+            prefs.edit().putBoolean("track_reels", on).apply()
+            _trackReels.value = on
         }
     }
 
-    fun setPlatform(platform: Platform) {
-        prefs.edit().putString("platform", platform.name).apply()
-        _platform.value = platform
+    fun setLimit(value: Int) {
+        val v = value.coerceIn(1, 99_999)
+        prefs.edit().putInt("limit", v).apply()
+        _limit.value = v
+    }
+
+    fun setSeconds(value: Int) {
+        val v = value.coerceIn(1, 30)
+        prefs.edit().putInt("fallback_seconds", v).apply()
+        _seconds.value = v
     }
 
     fun setDarkTheme(dark: Boolean) {

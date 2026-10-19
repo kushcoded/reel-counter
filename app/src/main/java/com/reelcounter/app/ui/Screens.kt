@@ -52,6 +52,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.reelcounter.app.AppSettings
 import com.reelcounter.app.Distance
 import com.reelcounter.app.Platform
+import com.reelcounter.app.ReelRepository
 import com.reelcounter.app.ReelCounterService
 import com.reelcounter.app.WatchTime
 import kotlinx.coroutines.delay
@@ -88,10 +89,9 @@ fun ReelCounterTheme(dark: Boolean, content: @Composable () -> Unit) {
 fun AppRoot() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
-    val platform by AppSettings.platform.collectAsStateWithLifecycle()
-    val counts by platform.store.counts.collectAsStateWithLifecycle()
-    val watch by platform.store.watchMs.collectAsStateWithLifecycle()
-    val limit by AppSettings.limit(platform).collectAsStateWithLifecycle()
+    val counts by ReelRepository.store.counts.collectAsStateWithLifecycle()
+    val watch by ReelRepository.store.watchMs.collectAsStateWithLifecycle()
+    val limit by AppSettings.limit.collectAsStateWithLifecycle()
     val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val dark by AppSettings.darkTheme.collectAsStateWithLifecycle()
 
@@ -115,53 +115,32 @@ fun AppRoot() {
             )
         },
         bottomBar = {
-            Column {
-                PlatformToggle(platform) { AppSettings.setPlatform(it) }
-                NavigationBar {
-                    NavigationBarItem(
-                        selected = tab == 0, onClick = { tab = 0 },
-                        icon = { Icon(Icons.Default.Home, contentDescription = null) }, label = { Text("Today") }
-                    )
-                    NavigationBarItem(
-                        selected = tab == 1, onClick = { tab = 1 },
-                        icon = { Icon(Icons.Default.DateRange, contentDescription = null) }, label = { Text("History") }
-                    )
-                }
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == 0, onClick = { tab = 0 },
+                    icon = { Icon(Icons.Default.Home, contentDescription = null) }, label = { Text("Today") }
+                )
+                NavigationBarItem(
+                    selected = tab == 1, onClick = { tab = 1 },
+                    icon = { Icon(Icons.Default.DateRange, contentDescription = null) }, label = { Text("History") }
+                )
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(platform, counts, watch, limit, cmPerReel, Modifier.padding(padding))
-        else HistoryScreen(platform, counts, watch, limit, cmPerReel, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
+        else HistoryScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
     }
 
     if (confirmClear) {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
-            title = { Text("Clear ${platform.label} history?") },
-            text = { Text("This deletes every daily ${platform.noun} total and watch time.") },
+            title = { Text("Clear all history?") },
+            text = { Text("This deletes every daily total and all watch time.") },
             confirmButton = {
-                TextButton(onClick = { platform.store.clearAll(); confirmClear = false }) { Text("Clear") }
+                TextButton(onClick = { ReelRepository.store.clearAll(); confirmClear = false }) { Text("Clear") }
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
         )
-    }
-}
-
-/** Reels | Shorts switch above the navigation bar; every screen shows the selected feed. */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun PlatformToggle(selected: Platform, onSelect: (Platform) -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Platform.entries.forEachIndexed { i, p ->
-                SegmentedButton(
-                    selected = p == selected,
-                    onClick = { onSelect(p) },
-                    shape = SegmentedButtonDefaults.itemShape(index = i, count = Platform.entries.size),
-                    label = { Text("${p.appName} ${p.label}", maxLines = 1) }
-                )
-            }
-        }
     }
 }
 
@@ -224,7 +203,7 @@ private fun CardTitle(title: String, info: String? = null, trailing: @Composable
 // ---------------------------------------------------------------------------- Today tab
 
 @Composable
-fun HomeScreen(platform: Platform, counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
+fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val totalReels = remember(counts) { counts.values.sum() }
@@ -244,18 +223,20 @@ fun HomeScreen(platform: Platform, counts: Map<String, Int>, watch: Map<String, 
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
-        TodayCard(platform, todayCount, limit, today)
-        LimitCard(platform, limit)
+        TodayCard(todayCount, limit, today)
+        LimitCard(limit)
         WeekCard(counts, limit, today)
-        WatchTimeCard(platform, todayWatch, totalWatch, totalWatch / watchDays, todayCount, reelsOnWatchedDays)
-        DistanceCard(platform, todayCount, totalReels, cmPerReel)
+        WatchTimeCard(todayWatch, totalWatch, totalWatch / watchDays, todayCount, reelsOnWatchedDays)
+        DistanceCard(todayCount, totalReels, cmPerReel)
         PopupCard(todayCount, limit)
+        WatchRuleCard()
+        SourcesCard()
         Footer()
     }
 }
 
 @Composable
-private fun TodayCard(platform: Platform, count: Int, limit: Int, today: LocalDate) {
+private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
     val over = count > limit
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -264,7 +245,7 @@ private fun TodayCard(platform: Platform, count: Int, limit: Int, today: LocalDa
                 count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
             )
-            Text("${platform.noun} watched today", style = MaterialTheme.typography.bodyLarge)
+            Text("reels & shorts today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
                 progress = { min(1f, count.toFloat() / limit) },
@@ -282,7 +263,7 @@ private fun TodayCard(platform: Platform, count: Int, limit: Int, today: LocalDa
 }
 
 @Composable
-private fun LimitCard(platform: Platform, limit: Int) {
+private fun LimitCard(limit: Int) {
     var edit by remember { mutableStateOf(false) }
 
     Card(Modifier.fillMaxWidth()) {
@@ -298,17 +279,17 @@ private fun LimitCard(platform: Platform, limit: Int) {
         var text by remember { mutableStateOf(limit.toString()) }
         val focus = remember { FocusRequester() }
         val save = {
-            text.toIntOrNull()?.let { AppSettings.setLimit(platform, it) }
+            text.toIntOrNull()?.let { AppSettings.setLimit(it) }
             edit = false
         }
         AlertDialog(
             onDismissRequest = { edit = false },
-            title = { Text("Daily ${platform.singular} limit") },
+            title = { Text("Daily reel limit") },
             text = {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it.filter(Char::isDigit).take(5) },
-                    label = { Text("${platform.label} per day") },
+                    label = { Text("Reels & shorts per day") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
@@ -318,7 +299,7 @@ private fun LimitCard(platform: Platform, limit: Int) {
             },
             confirmButton = { TextButton(onClick = { save() }) { Text("Save") } },
             dismissButton = {
-                TextButton(onClick = { AppSettings.setLimit(platform, AppSettings.DEFAULT_LIMIT); edit = false }) { Text("Reset to ${AppSettings.DEFAULT_LIMIT}") }
+                TextButton(onClick = { AppSettings.setLimit(AppSettings.DEFAULT_LIMIT); edit = false }) { Text("Reset to ${AppSettings.DEFAULT_LIMIT}") }
             }
         )
     }
@@ -357,7 +338,6 @@ private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
 
 @Composable
 private fun WatchTimeCard(
-    platform: Platform,
     todayMs: Long, totalMs: Long, dailyAvgMs: Long,
     todayReels: Int, reelsOnWatchedDays: Int
 ) {
@@ -370,7 +350,7 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Average time per ${platform.singular}", style = MaterialTheme.typography.titleSmall)
+            Text("Average time per reel", style = MaterialTheme.typography.titleSmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
@@ -381,10 +361,10 @@ private fun WatchTimeCard(
 }
 
 @Composable
-private fun DistanceCard(platform: Platform, todayReels: Int, totalReels: Int, cmPerReel: Float) {
+private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     val info = buildString {
-        append("Distance = ${platform.noun} watched × scroll length per ${platform.singular}. Changing the length recalculates every day, including past ones.")
+        append("Distance = reels & shorts counted × scroll length per reel (1 short = 1 reel). Changing the length recalculates every day, including past ones.")
         fact.next?.let { append("\n\n").append(it) }
     }
     Card(Modifier.fillMaxWidth()) {
@@ -397,7 +377,7 @@ private fun DistanceCard(platform: Platform, todayReels: Int, totalReels: Int, c
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             HorizontalDivider()
             Text(
-                "Scroll length per ${platform.singular}: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
+                "Scroll length per reel: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
                 style = MaterialTheme.typography.bodyMedium
             )
             Slider(
@@ -433,8 +413,7 @@ private fun PopupCard(count: Int, limit: Int) {
             CardTitle(
                 "Floating counter",
                 "Shows your count on top of Instagram, and on YouTube's Shorts screen. You can drag it anywhere on screen and it remembers where you left it. " +
-                        "Transparency only fades the dark background; the number stays solid.\n\n" +
-                        "Each reel or short counts the moment you scroll to it; going back up and down never counts the same one twice."
+                        "Transparency only fades the dark background; the number stays solid."
             ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
@@ -467,9 +446,45 @@ private fun PopupCard(count: Int, limit: Int) {
 }
 
 @Composable
+private fun WatchRuleCard() {
+    val seconds by AppSettings.seconds.collectAsStateWithLifecycle()
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            CardTitle(
+                "What counts as a reel",
+                "A reel or short counts once you've stayed on it for this many seconds. Scrolling back up and down never counts the same one twice."
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Time on a reel", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                OutlinedButton(onClick = { AppSettings.setSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
+                Text("$seconds s", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp))
+                OutlinedButton(onClick = { AppSettings.setSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
+            }
+        }
+    }
+}
+
+/** One switch per app. Off = the service ignores that app completely (no counting, no popup). */
+@Composable
+private fun SourcesCard() {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            CardTitle("Count from", "Turning an app off stops all counting and the floating counter for it.")
+            Platform.entries.forEach { p ->
+                val on by AppSettings.tracking(p).collectAsStateWithLifecycle()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("${p.appName} ${p.label}", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    Switch(checked = on, onCheckedChange = { AppSettings.setTracking(p, it) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun Footer() {
     Text(
-        "Licensed under GPLv3.0  ·  No user data is collected",
+        "Licensed under GPLv3.0",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,
@@ -506,7 +521,7 @@ private fun SetupCard() {
 // ---------------------------------------------------------------------------- History tab
 
 @Composable
-fun HistoryScreen(platform: Platform, counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
+fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
     val today = rememberToday()
     // Only days that have reels, plus today; newest first.
     val rows = remember(counts, today) {
@@ -544,7 +559,7 @@ fun HistoryScreen(platform: Platform, counts: Map<String, Int>, watch: Map<Strin
         if (total == 0) {
             item {
                 Text(
-                    "No ${platform.noun} counted yet.\nScroll through ${platform.label} in ${platform.appName} and they'll show up here.",
+                    "No reels or shorts counted yet.\nScroll through Reels or Shorts and they'll show up here.",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
