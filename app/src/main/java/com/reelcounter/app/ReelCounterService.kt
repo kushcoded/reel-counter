@@ -45,12 +45,23 @@ class ReelCounterService : AccessibilityService() {
         /** View ids that exist only inside the full-screen pager. */
         val viewerIds: List<String>,
         /** Show the popup on every screen of the app (true) or only inside the pager (false). */
-        val popupEverywhere: Boolean
+        val popupEverywhere: Boolean,
+        /**
+         * false: identify the reel by the pager position that scroll events report (Instagram).
+         * true: identify it by the readable text on the page in the middle of the screen, polled
+         * lightly - scroll events from this pager are unreliable, so they only wake the poll (Shorts).
+         */
+        val readsPageKey: Boolean
     )
 
     private fun ids(p: Platform) = when (p) {
-        Platform.Reels -> PagerIds(listOf("clips_tab"), listOf("clips_viewer_view_pager"), popupEverywhere = true)
-        Platform.Shorts -> PagerIds(emptyList(), listOf("reel_recycler", "reel_player_page_container"), popupEverywhere = false)
+        Platform.Reels -> PagerIds(
+            listOf("clips_tab"), listOf("clips_viewer_view_pager"), popupEverywhere = true, readsPageKey = false
+        )
+        Platform.Shorts -> PagerIds(
+            emptyList(), listOf("reel_recycler", "reel_player_page_container", "reel_watch_fragment_root"),
+            popupEverywhere = false, readsPageKey = true
+        )
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -62,6 +73,8 @@ class ReelCounterService : AccessibilityService() {
     private var active: Platform? = null
     private var inFeed = false
     private var feedCheckedAt = 0L
+    private var feedMisses = 0      // consecutive "pager not found" checks; leaving needs two in a row
+    private var lastPollAt = 0L
 
     // The reel/short currently on screen
     private var currentIndex = NONE
@@ -143,6 +156,11 @@ class ReelCounterService : AccessibilityService() {
         refreshFeedState(src, now)
         if (!inFeed) return
 
+        if (ids(src).readsPageKey) {
+            if (now - lastPollAt >= EVENT_POLL_MS) pollPage(src, now, rootInActiveWindow)
+            return
+        }
+
         val realIndex = if (event.fromIndex >= 0 && event.itemCount > 0) event.fromIndex else -1
 
         // Cheap path: nearly every scroll event (one per few pixels of a swipe) is for the reel we
@@ -191,6 +209,62 @@ class ReelCounterService : AccessibilityService() {
         if (currentIndex == UNKNOWN || countedIndices.add(currentIndex)) ReelRepository.store.adjustToday(1)
     }
 
+    /** The reel/short on screen changed (or was seen for the first time): finish the old one, time the new one. */
+    private fun observePage(key: Int, now: Long) {
+        if (currentIndex == NONE || key == currentIndex) return
+        if (currentIndex == UNKNOWN) {
+            // First look after entering: this is the page we have been timing all along.
+            currentIndex = key
+            if (currentCounted) countedIndices.add(key) else if (key in countedIndices) currentCounted = true
+        } else {
+            countIfDue(now)
+            startReel(key, now)
+        }
+    }
+
+    private fun pollPage(src: Platform, now: Long, root: AccessibilityNodeInfo?) {
+        lastPollAt = now
+        if (root == null || root.packageName?.toString() != src.pkg) return
+        readPageKey(src, root)?.let { observePage(it, now) }
+    }
+
+    /**
+     * Identity of the page in the middle of the screen: a hash of its first few readable texts (caption,
+     * channel, sound...). Bare counts like "1.2M" are skipped because they change while you watch.
+     * Bounded to a handful of nodes, and only run while a pager is open.
+     */
+    private fun readPageKey(src: Platform, root: AccessibilityNodeInfo): Int? {
+        val pager = ids(src).viewerIds.firstNotNullOfOrNull { id ->
+            root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").firstOrNull()
+        } ?: return null
+        val centre = resources.displayMetrics.heightPixels / 2
+        val r = Rect()
+        var page = pager
+        for (i in 0 until pager.childCount) {
+            val child = pager.getChild(i) ?: continue
+            child.getBoundsInScreen(r)
+            if (r.top <= centre && r.bottom >= centre) { page = child; break }
+        }
+
+        var hash = 17
+        var texts = 0
+        var visited = 0
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(page)
+        while (queue.isNotEmpty() && visited < MAX_PAGE_NODES && texts < MAX_PAGE_TEXTS) {
+            val node = queue.removeFirst()
+            visited++
+            val t = node.text
+            if (t != null && t.length >= MIN_TEXT_LEN && node.isVisibleToUser && !COUNT_LIKE.matches(t)) {
+                hash = 31 * hash + t.toString().hashCode()
+                texts++
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
+        }
+        if (texts == 0) return null
+        return if (hash == NONE || hash == UNKNOWN) hash + 2 else hash
+    }
+
     /** Forget the current pager session. Called when leaving the pager or the app. */
     private fun resetTracking(now: Long) {
         countIfDue(now)   // a reel watched long enough right before leaving still counts
@@ -210,6 +284,7 @@ class ReelCounterService : AccessibilityService() {
         active = src
         inFeed = false
         feedCheckedAt = 0L
+        feedMisses = 0
         updateEventTypes(src != null)
         tickerJob?.cancel()
         tickerJob = if (src != null) scope.launch { while (isActive) delay(tick()) } else null
@@ -238,23 +313,27 @@ class ReelCounterService : AccessibilityService() {
         val day = DayClock.today()
         if (day != lastDay) { lastDay = day; overlay.refresh() }   // new day: popup goes back to 0
         val now = SystemClock.uptimeMillis()
-        refreshFeedState(src, now)
-        if (!inFeed) return TICK_MS
+        val polls = ids(src).readsPageKey
+        val root = if (polls) rootInActiveWindow else null          // one IPC shared by the checks below
+        refreshFeedState(src, now, root)
+        val interval = if (polls) POLL_MS else TICK_MS
+        if (!inFeed) return interval
 
+        if (polls) pollPage(src, now, root)
         accountWatch(now)
         if (watchPendingMs >= WATCH_FLUSH_MS) flushWatch()
 
         countIfDue(now)
-        if (currentIndex == NONE || currentCounted) return TICK_MS
+        if (currentIndex == NONE || currentCounted) return interval
         val due = currentSince + AppSettings.seconds.value * 1000L
-        return (due - now).coerceIn(MIN_WAKE_MS, TICK_MS)
+        return (due - now).coerceIn(MIN_WAKE_MS, interval)
     }
 
     /** Is the Reels/Shorts pager on screen? Cached, since each lookup is an IPC round trip. */
-    private fun refreshFeedState(src: Platform, now: Long) {
+    private fun refreshFeedState(src: Platform, now: Long, preloaded: AccessibilityNodeInfo? = null) {
         if (now - feedCheckedAt < FEED_CACHE_MS) return
         feedCheckedAt = now
-        val root = rootInActiveWindow ?: return
+        val root = preloaded ?: rootInActiveWindow ?: return
         if (root.packageName?.toString() != src.pkg) return
         val pager = ids(src)
         val found = pager.tabIds.any { id ->
@@ -262,7 +341,12 @@ class ReelCounterService : AccessibilityService() {
         } || pager.viewerIds.any { id ->
             root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").isNotEmpty()
         }
-        setInFeed(found, now)
+        if (found) {
+            feedMisses = 0
+            setInFeed(true, now)
+        } else if (++feedMisses >= 2) {
+            setInFeed(false, now)
+        }
     }
 
     /** Ignores comment lists, carousels, etc. - the pager fills most of the screen. */
@@ -336,7 +420,13 @@ class ReelCounterService : AccessibilityService() {
     companion object {
         private const val TICK_MS = 1000L
         private const val MIN_WAKE_MS = 100L
-        private const val FEED_CACHE_MS = 900L
+        private const val FEED_CACHE_MS = 700L
+        private const val POLL_MS = 600L          // how often a Shorts page is re-read
+        private const val EVENT_POLL_MS = 300L    // at most this often when scroll events wake the poll
+        private const val MAX_PAGE_NODES = 40
+        private const val MAX_PAGE_TEXTS = 6
+        private const val MIN_TEXT_LEN = 4
+        private val COUNT_LIKE = Regex("^[\\d.,]+\\s?[KkMmBb]?\\+?$")
         private const val MAX_WATCH_GAP_MS = 3000L
         private const val WATCH_FLUSH_MS = 15_000L
         private const val MIN_HEIGHT_RATIO = 0.6f
