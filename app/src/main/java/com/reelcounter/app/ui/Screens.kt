@@ -51,8 +51,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.reelcounter.app.AppSettings
 import com.reelcounter.app.Distance
-import com.reelcounter.app.ReelCounterService
+import com.reelcounter.app.Platform
 import com.reelcounter.app.ReelRepository
+import com.reelcounter.app.ReelCounterService
 import com.reelcounter.app.WatchTime
 import kotlinx.coroutines.delay
 import java.time.LocalDate
@@ -88,8 +89,8 @@ fun ReelCounterTheme(dark: Boolean, content: @Composable () -> Unit) {
 fun AppRoot() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
-    val counts by ReelRepository.counts.collectAsStateWithLifecycle()
-    val watch by ReelRepository.watchMs.collectAsStateWithLifecycle()
+    val counts by ReelRepository.store.counts.collectAsStateWithLifecycle()
+    val watch by ReelRepository.store.watchMs.collectAsStateWithLifecycle()
     val limit by AppSettings.limit.collectAsStateWithLifecycle()
     val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val dark by AppSettings.darkTheme.collectAsStateWithLifecycle()
@@ -134,9 +135,9 @@ fun AppRoot() {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("Clear all history?") },
-            text = { Text("This deletes every daily total.") },
+            text = { Text("This deletes every daily total and all watch time.") },
             confirmButton = {
-                TextButton(onClick = { ReelRepository.clearAll(); confirmClear = false }) { Text("Clear") }
+                TextButton(onClick = { ReelRepository.store.clearAll(); confirmClear = false }) { Text("Clear") }
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
         )
@@ -229,6 +230,8 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         DistanceCard(todayCount, totalReels, cmPerReel)
         PopupCard(todayCount, limit)
         WatchRuleCard()
+        SourcesCard()
+        Footer()
     }
 }
 
@@ -242,7 +245,7 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
                 count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
             )
-            Text("reels watched today", style = MaterialTheme.typography.bodyLarge)
+            Text("reels & shorts today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
                 progress = { min(1f, count.toFloat() / limit) },
@@ -286,7 +289,7 @@ private fun LimitCard(limit: Int) {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it.filter(Char::isDigit).take(5) },
-                    label = { Text("Reels per day") },
+                    label = { Text("Reels & shorts per day") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
@@ -361,7 +364,7 @@ private fun WatchTimeCard(
 private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     val info = buildString {
-        append("Distance = reels watched × scroll length per reel. Changing the length recalculates every day, including past ones.")
+        append("Distance = reels & shorts counted × scroll length per reel (1 short = 1 reel). Changing the length recalculates every day, including past ones.")
         fact.next?.let { append("\n\n").append(it) }
     }
     Card(Modifier.fillMaxWidth()) {
@@ -409,7 +412,7 @@ private fun PopupCard(count: Int, limit: Int) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
                 "Floating counter",
-                "Shows your count on top of Instagram. You can drag it anywhere on screen and it remembers where you left it. " +
+                "Shows your count on top of Instagram, and on YouTube's Shorts screen. You can drag it anywhere on screen and it remembers where you left it. " +
                         "Transparency only fades the dark background; the number stays solid."
             ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
@@ -444,22 +447,49 @@ private fun PopupCard(count: Int, limit: Int) {
 
 @Composable
 private fun WatchRuleCard() {
-    val seconds by AppSettings.fallbackSeconds.collectAsStateWithLifecycle()
+    val seconds by AppSettings.seconds.collectAsStateWithLifecycle()
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
                 "What counts as a reel",
-                "A reel counts once you've watched about 30% of it. Scrolling back up and down never counts the same reel twice.\n\n" +
-                        "If your Instagram version doesn't share playback progress, a reel counts after the fallback time below instead."
+                "A reel or short counts once you've stayed on it for this many seconds. Scrolling back up and down never counts the same one twice."
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Fallback watch time", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
+                Text("Time on a reel", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                OutlinedButton(onClick = { AppSettings.setSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
                 Text("$seconds s", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp))
-                OutlinedButton(onClick = { AppSettings.setFallbackSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
+                OutlinedButton(onClick = { AppSettings.setSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
             }
         }
     }
+}
+
+/** One switch per app. Off = the service ignores that app completely (no counting, no popup). */
+@Composable
+private fun SourcesCard() {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            CardTitle("Count from", "Turning an app off stops all counting and the floating counter for it.")
+            Platform.entries.forEach { p ->
+                val on by AppSettings.tracking(p).collectAsStateWithLifecycle()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("${p.appName} ${p.label}", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    Switch(checked = on, onCheckedChange = { AppSettings.setTracking(p, it) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun Footer() {
+    Text(
+        "Licensed under GPLv3.0",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+    )
 }
 
 @Composable
@@ -472,7 +502,7 @@ private fun SetupCard() {
                 Text("Turn on the counter", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                "Enable Reel Counter in Accessibility settings so it can see which reel you're on. Everything stays on your phone.",
+                "Enable Reel Counter in Accessibility settings so it can see which reel or short you're on. Everything stays on your phone.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
@@ -529,7 +559,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
         if (total == 0) {
             item {
                 Text(
-                    "No reels counted yet.\nWatch some Reels in Instagram and they'll show up here.",
+                    "No reels or shorts counted yet.\nScroll through Reels or Shorts and they'll show up here.",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -572,6 +602,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
                 }
             }
         }
+        item { Footer() }
     }
 }
 

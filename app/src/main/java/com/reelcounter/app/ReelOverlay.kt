@@ -67,7 +67,7 @@ class ReelOverlay(private val service: AccessibilityService) {
     /** Re-reads count, limit and transparency. Text turns red once the count is above the limit. */
     fun refresh() {
         val view = label ?: return
-        val count = ReelRepository.todayCount()
+        val count = ReelRepository.store.todayCount()
         val over = count > AppSettings.limit.value
         val bgAlpha = ((1f - AppSettings.transparency.value) * 255f).roundToInt().coerceIn(0, 255)
 
