@@ -3,10 +3,6 @@
 Counts how many Instagram reels you swipe through each day, keeps a history,
 and shows a tiny draggable counter on top of Instagram.
 
-## Build
-1. Open this folder in **Android Studio** (Koala or newer) and let Gradle sync.
-2. Run on a device (Android 8.0+ / API 26+) or build an APK: *Build > Build APK(s)*.
-
 ## Installation guide
 
 1. Open the APK. If Android asks, tap Settings and turn on Allow from this source.
