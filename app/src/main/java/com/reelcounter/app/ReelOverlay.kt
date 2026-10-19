@@ -40,8 +40,8 @@ class ReelOverlay(private val service: AccessibilityService) {
         PixelFormat.TRANSLUCENT
     ).apply { gravity = Gravity.TOP or Gravity.START }
 
-    fun show() {
-        if (label != null) { refresh(); return }
+    fun show(platform: Platform) {
+        if (label != null) { refresh(platform); return }
         val dm = service.resources.displayMetrics
         params.x = AppSettings.overlayX.coerceIn(0, (dm.widthPixels - (60 * density).toInt()).coerceAtLeast(0))
         params.y = AppSettings.overlayY.coerceIn(0, (dm.heightPixels - (40 * density).toInt()).coerceAtLeast(0))
@@ -50,7 +50,7 @@ class ReelOverlay(private val service: AccessibilityService) {
             wm.addView(view, params)
             label = view
             lastCount = -1; lastOver = null; lastBgAlpha = -1
-            refresh()
+            refresh(platform)
         } catch (_: Exception) {
             label = null
             bgDrawable = null
@@ -65,10 +65,10 @@ class ReelOverlay(private val service: AccessibilityService) {
     }
 
     /** Re-reads count, limit and transparency. Text turns red once the count is above the limit. */
-    fun refresh() {
+    fun refresh(platform: Platform) {
         val view = label ?: return
-        val count = ReelRepository.todayCount()
-        val over = count > AppSettings.limit.value
+        val count = platform.store.todayCount()
+        val over = count > AppSettings.limit(platform).value
         val bgAlpha = ((1f - AppSettings.transparency.value) * 255f).roundToInt().coerceIn(0, 255)
 
         if (count != lastCount) view.text = "▶ $count"

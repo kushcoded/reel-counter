@@ -6,23 +6,27 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Daily reel totals, keyed by ISO date ("2026-10-18"). Shared by the UI and the accessibility service. */
-object ReelRepository {
+/**
+ * Daily totals for one platform, keyed by ISO date ("2026-10-18"): reels counted, and
+ * milliseconds spent on the feed. Shared by the UI and the accessibility service.
+ */
+class CountStore(private val countsFile: String, private val watchFile: String) {
     private lateinit var prefs: SharedPreferences
     private lateinit var watchPrefs: SharedPreferences
+
     private val _counts = MutableStateFlow<Map<String, Int>>(emptyMap())
     val counts: StateFlow<Map<String, Int>> = _counts.asStateFlow()
 
-    /** Milliseconds spent on the Reels screen, per day. */
     private val _watchMs = MutableStateFlow<Map<String, Long>>(emptyMap())
     val watchMs: StateFlow<Map<String, Long>> = _watchMs.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
         if (::prefs.isInitialized) return
-        prefs = context.applicationContext.getSharedPreferences("reel_counts", Context.MODE_PRIVATE)
+        val app = context.applicationContext
+        prefs = app.getSharedPreferences(countsFile, Context.MODE_PRIVATE)
+        watchPrefs = app.getSharedPreferences(watchFile, Context.MODE_PRIVATE)
         _counts.value = prefs.all.mapNotNull { (k, v) -> (v as? Int)?.let { k to it } }.toMap()
-        watchPrefs = context.applicationContext.getSharedPreferences("watch_time", Context.MODE_PRIVATE)
         _watchMs.value = watchPrefs.all.mapNotNull { (k, v) -> (v as? Long)?.let { k to it } }.toMap()
     }
 
@@ -55,6 +59,19 @@ object ReelRepository {
     }
 }
 
+object ReelRepository {
+    // Instagram keeps the original file names, so existing installs keep their history.
+    val reels = CountStore("reel_counts", "watch_time")
+    val shorts = CountStore("short_counts", "short_watch_time")
+
+    fun init(context: Context) {
+        reels.init(context)
+        shorts.init(context)
+    }
+
+    fun store(platform: Platform): CountStore = if (platform == Platform.Shorts) shorts else reels
+}
+
 /** User settings + remembered position of the floating counter. */
 object AppSettings {
     const val DEFAULT_LIMIT = 100
@@ -66,34 +83,53 @@ object AppSettings {
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
-    private val _limit = MutableStateFlow(DEFAULT_LIMIT)
+    private val _limitReels = MutableStateFlow(DEFAULT_LIMIT)
+    private val _limitShorts = MutableStateFlow(DEFAULT_LIMIT)
     private val _transparency = MutableStateFlow(DEFAULT_TRANSPARENCY)
-    private val _fallbackSeconds = MutableStateFlow(3)
     private val _cmPerReel = MutableStateFlow(DEFAULT_CM_PER_REEL)
     private val _darkTheme = MutableStateFlow(true)
+    private val _platform = MutableStateFlow(Platform.Reels)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
-    /** Daily limit; the popup turns red once today's count is above it. */
-    val limit: StateFlow<Int> = _limit.asStateFlow()
     /** Transparency of the popup's dark background only (0 = solid, 1 = invisible). The number stays opaque. */
     val transparency: StateFlow<Float> = _transparency.asStateFlow()
-    /** Used only when Instagram doesn't expose playback progress: a reel counts after this long. */
-    val fallbackSeconds: StateFlow<Int> = _fallbackSeconds.asStateFlow()
-    /** Thumb travel per reel, in cm; drives every distance figure. */
+    /** Thumb travel per reel/short, in cm; drives every distance figure. */
     val cmPerReel: StateFlow<Float> = _cmPerReel.asStateFlow()
     /** App theme; dark by default. */
     val darkTheme: StateFlow<Boolean> = _darkTheme.asStateFlow()
+    /** Which feed the app screens are showing. */
+    val platform: StateFlow<Platform> = _platform.asStateFlow()
 
     @Synchronized
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
         _overlayEnabled.value = prefs.getBoolean("overlay", true)
-        _limit.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
+        _limitReels.value = prefs.getInt("limit", prefs.getInt("goal", DEFAULT_LIMIT))
+        _limitShorts.value = prefs.getInt("limit_shorts", DEFAULT_LIMIT)
         _transparency.value = prefs.getFloat("transparency", DEFAULT_TRANSPARENCY).coerceIn(0f, MAX_TRANSPARENCY)
-        _fallbackSeconds.value = prefs.getInt("fallback_seconds", 3)
-        _darkTheme.value = prefs.getBoolean("dark_theme", true)
         _cmPerReel.value = prefs.getFloat("cm_per_reel", DEFAULT_CM_PER_REEL).coerceIn(MIN_CM_PER_REEL, MAX_CM_PER_REEL)
+        _darkTheme.value = prefs.getBoolean("dark_theme", true)
+        _platform.value = Platform.entries.firstOrNull { it.name == prefs.getString("platform", null) } ?: Platform.Reels
+    }
+
+    /** Daily limit for a feed; the popup turns red once that feed's count is above it. */
+    fun limit(platform: Platform): StateFlow<Int> = if (platform == Platform.Shorts) _limitShorts else _limitReels
+
+    fun setLimit(platform: Platform, value: Int) {
+        val v = value.coerceIn(1, 99_999)
+        if (platform == Platform.Shorts) {
+            prefs.edit().putInt("limit_shorts", v).apply()
+            _limitShorts.value = v
+        } else {
+            prefs.edit().putInt("limit", v).apply()
+            _limitReels.value = v
+        }
+    }
+
+    fun setPlatform(platform: Platform) {
+        prefs.edit().putString("platform", platform.name).apply()
+        _platform.value = platform
     }
 
     fun setDarkTheme(dark: Boolean) {
@@ -106,15 +142,13 @@ object AppSettings {
         _overlayEnabled.value = enabled
     }
 
-    fun setLimit(value: Int) {
-        val v = value.coerceIn(1, 99_999)
-        prefs.edit().putInt("limit", v).apply()
-        _limit.value = v
-    }
-
     /** Live update while the slider moves; call [persistTransparency] when the finger lifts. */
     fun setTransparency(value: Float) {
         _transparency.value = value.coerceIn(0f, MAX_TRANSPARENCY)
+    }
+
+    fun persistTransparency() {
+        prefs.edit().putFloat("transparency", _transparency.value).apply()
     }
 
     /** Live update while the slider moves; call [persistCmPerReel] when the finger lifts. */
@@ -124,16 +158,6 @@ object AppSettings {
 
     fun persistCmPerReel() {
         prefs.edit().putFloat("cm_per_reel", _cmPerReel.value).apply()
-    }
-
-    fun persistTransparency() {
-        prefs.edit().putFloat("transparency", _transparency.value).apply()
-    }
-
-    fun setFallbackSeconds(value: Int) {
-        val v = value.coerceIn(1, 30)
-        prefs.edit().putInt("fallback_seconds", v).apply()
-        _fallbackSeconds.value = v
     }
 
     var overlayX: Int

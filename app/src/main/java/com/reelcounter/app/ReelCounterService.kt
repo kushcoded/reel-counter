@@ -24,55 +24,56 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Watches Instagram Reels and counts a reel once it has been watched ~30%.
+ * Counts Instagram Reels and YouTube Shorts - each [Platform] keeps its own totals - and keeps the floating
+ * counter in sync.
  *
- * How a reel is counted:
- *  - The reel on screen is tracked by its position in the pager (index).
- *  - A ticker checks it every [TICK_MS]. If Instagram exposes the playback progress bar,
- *    the reel counts once progress reaches [WATCH_FRACTION]. Otherwise it counts after the
- *    "fallback seconds" setting.
- *  - Every counted index is remembered, so scrolling back up and down again never counts twice.
+ * A reel/short counts the moment you scroll to it. Each pager position is remembered, so scrolling back up
+ * and down never counts the same one twice; that memory is wiped whenever you leave the Reels/Shorts screen
+ * or the app, so a fresh session is never skipped.
  *
- * Everything Instagram-specific lives in the constants at the bottom.
+ * Everything app-specific lives in [ids] and the constants at the bottom. Instagram and YouTube change
+ * their internals from time to time, so if counting stops working, that is the place to tune.
  */
 class ReelCounterService : AccessibilityService() {
+
+    /** How to recognise a platform's vertical short-video pager. */
+    private class PagerIds(
+        /** Bottom-bar tab ids (without package prefix) that are "selected" while the feed is open. */
+        val tabIds: List<String>,
+        /** View ids that exist only inside the full-screen pager. */
+        val viewerIds: List<String>,
+        /** Show the popup on every screen of the app (true) or only inside the pager (false). */
+        val popupEverywhere: Boolean
+    )
+
+    private fun ids(p: Platform) = when (p) {
+        Platform.Reels -> PagerIds(listOf("clips_tab"), listOf("clips_viewer_view_pager"), popupEverywhere = true)
+        Platform.Shorts -> PagerIds(emptyList(), listOf("reel_recycler", "reel_player_page_container"), popupEverywhere = false)
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var overlay: ReelOverlay
     private var tickerJob: Job? = null
-
-    private var igForeground = false
     private var imePackage: String? = null
 
-    // Reel tracking state
+    // Which tracked app is in the foreground, and whether its Reels/Shorts pager is on screen
+    private var active: Platform? = null
+    private var inFeed = false
+    private var feedCheckedAt = 0L
+
+    // Counting state
     private var currentIndex = NONE
-    private var currentSince = 0L
-    private var currentCounted = false
-    private var maxFraction = 0f
-    private var progressSeen = false
     private val countedIndices = HashSet<Int>()
-    private var leftAt = 0L
-
-    // Scroll/gesture state
-    private var lastScrollAt = 0L
     private var pseudoIndex = 0
-    private var lastIndexWasReal = false
-
-    // Cached playback-progress bar (looking it up is expensive, reading it is cheap)
-    private var progressNode: AccessibilityNodeInfo? = null
-    private var progressSearchAt = 0L
+    private var lastScrollAt = 0L
     private var lastDay = ""
 
     // Watch time: accumulated in memory, written to disk in batches
-    private var watchMark = 0L          // uptime up to which time has been accounted; 0 = not on Reels
+    private var watchMark = 0L          // uptime up to which time has been accounted; 0 = not watching
     private var watchPendingMs = 0L
 
-    // Reels-screen detection cache
-    private var reelsCheckedAt = 0L
-    private var reelsCached = false
-
     private val screenOffReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) = setForeground(false)
+        override fun onReceive(context: Context?, intent: Intent?) = setActive(null)
     }
 
     override fun onServiceConnected() {
@@ -88,13 +89,15 @@ class ReelCounterService : AccessibilityService() {
             this, screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED
         )
         scope.launch {
-            combine(ReelRepository.counts, AppSettings.limit, AppSettings.transparency) { _, _, _ -> }
-                .collect { overlay.refresh() }
+            combine(
+                Platform.Reels.store.counts, Platform.Shorts.store.counts,
+                AppSettings.limit(Platform.Reels), AppSettings.limit(Platform.Shorts), AppSettings.transparency
+            ) { _, _, _, _, _ -> }.collect { active?.let { overlay.refresh(it) } }
         }
         scope.launch { AppSettings.overlayEnabled.collect { syncOverlay() } }
 
-        updateEventTypes(instagramOpen = false)   // scroll events only matter while Instagram is open
-        if (rootInActiveWindow?.packageName?.toString() == INSTAGRAM) { setForeground(true); syncOverlay() }
+        updateEventTypes(appOpen = false)   // scroll events only matter while a tracked app is open
+        Platform.fromPackage(rootInActiveWindow?.packageName?.toString() ?: "")?.let { setActive(it) }
     }
 
     // ------------------------------------------------------------------ events
@@ -103,52 +106,50 @@ class ReelCounterService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> onWindowChanged(pkg, event.className?.toString())
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> if (pkg == INSTAGRAM) onScroll(event)
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> if (pkg == active?.pkg) onScroll(event)
         }
     }
 
     private fun onWindowChanged(pkg: String, className: String?) {
+        val src = Platform.fromPackage(pkg)
         when {
-            pkg == INSTAGRAM -> { setForeground(true); syncOverlay() }
-            // Status bar, keyboard and our own overlay must not count as "left Instagram".
+            src != null -> if (active == src) syncOverlay() else setActive(src)
+            // Status bar, keyboard and our own overlay must not count as "left the app".
             pkg == "com.android.systemui" || pkg == imePackage -> Unit
             pkg == packageName && className != MainActivity::class.java.name -> Unit
-            else -> setForeground(false)
+            else -> setActive(null)
         }
     }
 
     private fun onScroll(event: AccessibilityEvent) {
-        setForeground(true)
-        if (!isInReels()) { resetTracking(); return }
-
+        val src = active ?: return
         val now = SystemClock.uptimeMillis()
+        refreshFeedState(src, now)
+        if (!inFeed) return
+
         val realIndex = if (event.fromIndex >= 0 && event.itemCount > 0) event.fromIndex else -1
 
         // Cheap path: nearly every scroll event (one per few pixels of a swipe) is for the reel we
         // already track, so skip the expensive checks below.
         if (realIndex >= 0 && realIndex == currentIndex) { lastScrollAt = now; return }
-        if (!looksLikeReelPager(event.source)) return
+        if (!looksLikePager(event.source)) return
 
-        lastIndexWasReal = realIndex >= 0
         val index = if (realIndex >= 0) realIndex else nextGestureIndex(event, now)
         lastScrollAt = now
+        if (index == currentIndex) return
 
-        when {
-            currentIndex == NONE -> startTracking(index, now)
-            currentIndex == UNKNOWN && lastIndexWasReal -> {
-                // First scroll after entering Reels: the reel we were already timing is `index`.
-                currentIndex = index
-                if (currentCounted) countedIndices.add(index) else if (index in countedIndices) currentCounted = true
-            }
-            currentIndex == UNKNOWN || index != currentIndex -> {
-                // Pager jumped back to the very top after being deep in the feed = refreshed feed.
-                if (index == 0 && currentIndex >= 3) countedIndices.clear()
-                startTracking(index, now)
-            }
-        }
+        // Pager jumped back to the very top after being deep in the feed = refreshed feed.
+        if (index == 0 && currentIndex >= 3) countedIndices.clear()
+
+        // A fast flick can skip events; count the few positions it passed over as well.
+        val from = if (currentIndex != NONE && index - currentIndex in 2..MAX_SKIPPED) currentIndex + 1 else index
+        currentIndex = index
+        var added = 0
+        for (i in from..index) if (countedIndices.add(i)) added++
+        if (added > 0) src.store.adjustToday(added)
     }
 
-    /** Fallback when Instagram reports no pager position: one step per swipe gesture, direction if known. */
+    /** Fallback when the app reports no pager position: one step per swipe gesture, direction if known. */
     private fun nextGestureIndex(event: AccessibilityEvent, now: Long): Int {
         if (now - lastScrollAt > GESTURE_GAP_MS) {
             val backwards = Build.VERSION.SDK_INT >= 28 && event.scrollDeltaY < 0
@@ -157,96 +158,70 @@ class ReelCounterService : AccessibilityService() {
         return pseudoIndex
     }
 
-    // ------------------------------------------------------------------ watching logic
+    // ------------------------------------------------------------------ state
 
-    private fun setForeground(value: Boolean) {
-        if (igForeground == value) return
-        igForeground = value
-        updateEventTypes(value)
-        if (value) {
-            tickerJob = scope.launch {
-                while (isActive) {
-                    // Poll fast only while a reel is being timed, slowly otherwise.
-                    delay(if (currentIndex != NONE && !currentCounted) TICK_MS else IDLE_TICK_MS)
-                    tick()
-                }
-            }
-        } else {
-            tickerJob?.cancel()
-            tickerJob = null
-            resetTracking()
-            // Instagram was closed: forget which reels were counted, so its next session
-            // (which starts again from position 0) never has new reels skipped.
-            countedIndices.clear()
-            pseudoIndex = 0
-        }
+    private fun setActive(src: Platform?) {
+        if (active == src) return
+        endWatch(SystemClock.uptimeMillis())
+        resetTracking()
+        active = src
+        inFeed = false
+        feedCheckedAt = 0L
+        updateEventTypes(src != null)
+        tickerJob?.cancel()
+        tickerJob = if (src != null) scope.launch { while (isActive) { delay(TICK_MS); tick() } } else null
         syncOverlay()
     }
 
-    /** Other apps' scroll events are pure overhead, so only subscribe to them while Instagram is open. */
-    private fun updateEventTypes(instagramOpen: Boolean) {
-        val info = serviceInfo ?: return
-        val wanted = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                (if (instagramOpen) AccessibilityEvent.TYPE_VIEW_SCROLLED else 0)
-        if (info.eventTypes != wanted) {
-            info.eventTypes = wanted
-            serviceInfo = info
-        }
+    private fun setInFeed(value: Boolean, now: Long) {
+        if (inFeed == value) return
+        inFeed = value
+        if (value) watchMark = now else { endWatch(now); resetTracking() }
+        syncOverlay()
     }
 
-    private fun startTracking(index: Int, now: Long) {
-        currentIndex = index
-        currentSince = now
-        currentCounted = index != UNKNOWN && index in countedIndices
-        maxFraction = 0f
-        progressSeen = false
-        progressNode = null
-        progressSearchAt = 0L
-    }
-
+    /** Forget everything about the current pager session (positions counted, scroll state). */
     private fun resetTracking() {
-        endWatch(SystemClock.uptimeMillis())
-        if (currentIndex != NONE) leftAt = SystemClock.uptimeMillis()
         currentIndex = NONE
-        currentCounted = false
-        maxFraction = 0f
-        progressSeen = false
-        progressNode = null
+        countedIndices.clear()
+        pseudoIndex = 0
     }
 
+    /** One light check per second while a tracked app is open; the only periodic work in the service. */
     private fun tick() {
-        if (!igForeground) return
+        val src = active ?: return
         val day = DayClock.today()
-        if (day != lastDay) { lastDay = day; overlay.refresh() }   // new day: popup goes back to 0
-        if (!isInReels()) { resetTracking(); return }
+        if (day != lastDay) { lastDay = day; overlay.refresh(src) }   // new day: popup goes back to 0
         val now = SystemClock.uptimeMillis()
-        if (watchMark == 0L) {
-            watchMark = now
-        } else {
+        refreshFeedState(src, now)
+        if (inFeed) {
             accountWatch(now)
             if (watchPendingMs >= WATCH_FLUSH_MS) flushWatch()
         }
-        if (currentIndex == NONE) {
-            // New visit to Reels. Keep old "already counted" memory unless we've been away a while.
-            if (now - leftAt > SESSION_TIMEOUT_MS) countedIndices.clear()
-            startTracking(UNKNOWN, now)
-            return
-        }
-        if (currentCounted) return
-        val dwell = now - currentSince
-        if (dwell < MIN_DWELL_MS) return
+    }
 
-        readProgress(now)?.let { f ->
-            if (f > 0f) { progressSeen = true; if (f > maxFraction) maxFraction = f }
+    /** Is the Reels/Shorts pager on screen? Cached, since each lookup is an IPC round trip. */
+    private fun refreshFeedState(src: Platform, now: Long) {
+        if (now - feedCheckedAt < FEED_CACHE_MS) return
+        feedCheckedAt = now
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != src.pkg) return
+        val pager = ids(src)
+        val found = pager.tabIds.any { id ->
+            root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").any { it.isSelected }
+        } || pager.viewerIds.any { id ->
+            root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").isNotEmpty()
         }
-        val watchedEnough = if (progressSeen) maxFraction >= WATCH_FRACTION
-        else dwell >= AppSettings.fallbackSeconds.value * 1000L
+        setInFeed(found, now)
+    }
 
-        if (watchedEnough) {
-            currentCounted = true
-            if (currentIndex != UNKNOWN) countedIndices.add(currentIndex)
-            ReelRepository.adjustToday(1)
-        }
+    /** Ignores comment lists, carousels, etc. - the pager fills most of the screen. */
+    private fun looksLikePager(node: AccessibilityNodeInfo?): Boolean {
+        node ?: return true
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        val dm = resources.displayMetrics
+        return r.height() >= dm.heightPixels * MIN_HEIGHT_RATIO && r.width() >= dm.widthPixels * MIN_WIDTH_RATIO
     }
 
     // ------------------------------------------------------------------ watch time
@@ -260,83 +235,33 @@ class ReelCounterService : AccessibilityService() {
 
     private fun flushWatch() {
         if (watchPendingMs <= 0L) return
-        ReelRepository.addWatchMs(watchPendingMs)
+        active?.store?.addWatchMs(watchPendingMs)
         watchPendingMs = 0L
     }
 
-    /** Left Reels (or Instagram, or the service stopped): account the last stretch and save. */
+    /** Left the pager (or the app, or the service stopped): account the last stretch and save. */
     private fun endWatch(now: Long) {
         if (watchMark != 0L) { accountWatch(now); watchMark = 0L }
         flushWatch()
     }
 
-    /** Playback progress (0..1) if Instagram exposes its thin progress bar to accessibility, else null. */
-    private fun readProgress(now: Long): Float? {
-        var node = progressNode
-        if (node != null && !(node.refresh() && node.isVisibleToUser)) { node = null; progressNode = null }
-        if (node == null) {
-            if (now - progressSearchAt < PROGRESS_SEARCH_INTERVAL_MS) return null
-            progressSearchAt = now
-            node = findProgressNode() ?: return null
-            progressNode = node
-        }
-        val info = (node ?: return null).rangeInfo ?: return null
-        if (info.max <= info.min) return null
-        return ((info.current - info.min) / (info.max - info.min)).coerceIn(0f, 1f)
-    }
-
-    /** A wide, thin range-type node in the lower half of the Instagram window. */
-    private fun findProgressNode(): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
-        if (root.packageName?.toString() != INSTAGRAM) return null
-        val dm = resources.displayMetrics
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.addLast(root)
-        var visited = 0
-        val r = Rect()
-        while (queue.isNotEmpty() && visited < MAX_NODES) {
-            val node = queue.removeFirst()
-            visited++
-            val info = node.rangeInfo
-            if (info != null && info.max > info.min && node.isVisibleToUser) {
-                node.getBoundsInScreen(r)
-                if (r.width() >= dm.widthPixels * 0.6f && r.height() <= 48 * dm.density && r.top >= dm.heightPixels * 0.5f) {
-                    return node
-                }
-            }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
-        }
-        return null
-    }
-
-    // ------------------------------------------------------------------ screen checks
-
-    /** True when the Reels tab is selected or the full-screen reels viewer is on screen. */
-    private fun isInReels(): Boolean {
-        val now = SystemClock.uptimeMillis()
-        if (now - reelsCheckedAt < IN_REELS_CACHE_MS) return reelsCached
-        val root = rootInActiveWindow ?: return reelsCached
-        if (root.packageName?.toString() != INSTAGRAM) return reelsCached
-        reelsCheckedAt = now
-        reelsCached = REELS_TAB_IDS.any { id ->
-            root.findAccessibilityNodeInfosByViewId("$INSTAGRAM:id/$id").any { it.isSelected }
-        } || VIEWER_IDS.any { id ->
-            root.findAccessibilityNodeInfosByViewId("$INSTAGRAM:id/$id").isNotEmpty()
-        }
-        return reelsCached
-    }
-
-    /** Ignores comment lists, carousels, etc. - the reels pager fills most of the screen. */
-    private fun looksLikeReelPager(node: AccessibilityNodeInfo?): Boolean {
-        node ?: return true
-        val r = Rect()
-        node.getBoundsInScreen(r)
-        val dm = resources.displayMetrics
-        return r.height() >= dm.heightPixels * MIN_HEIGHT_RATIO && r.width() >= dm.widthPixels * MIN_WIDTH_RATIO
-    }
+    // ------------------------------------------------------------------ overlay & plumbing
 
     private fun syncOverlay() {
-        if (igForeground && AppSettings.overlayEnabled.value) overlay.show() else overlay.hide()
+        val src = active
+        if (src != null && AppSettings.overlayEnabled.value && (ids(src).popupEverywhere || inFeed)) overlay.show(src)
+        else overlay.hide()
+    }
+
+    /** Other apps' scroll events are pure overhead, so only subscribe to them while a tracked app is open. */
+    private fun updateEventTypes(appOpen: Boolean) {
+        val info = serviceInfo ?: return
+        val wanted = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                (if (appOpen) AccessibilityEvent.TYPE_VIEW_SCROLLED else 0)
+        if (info.eventTypes != wanted) {
+            info.eventTypes = wanted
+            serviceInfo = info
+        }
     }
 
     override fun onInterrupt() = Unit
@@ -355,29 +280,14 @@ class ReelCounterService : AccessibilityService() {
     }
 
     companion object {
-        const val INSTAGRAM = "com.instagram.android"
-
-        // --- Tuning knobs -------------------------------------------------------------
-        /** View ids (without package prefix) of the bottom-bar Reels tab. */
-        private val REELS_TAB_IDS = listOf("clips_tab")
-        /** View ids that exist only inside the full-screen reels viewer. */
-        private val VIEWER_IDS = listOf("clips_viewer_view_pager")
-
-        private const val WATCH_FRACTION = 0.3f          // "watched 30% or more"
-        private const val MIN_DWELL_MS = 1000L           // ignore progress readings right after a swipe
-        private const val TICK_MS = 400L
-        private const val IDLE_TICK_MS = 1200L
-        private const val IN_REELS_CACHE_MS = 900L
+        private const val TICK_MS = 1000L
+        private const val FEED_CACHE_MS = 900L
         private const val MAX_WATCH_GAP_MS = 3000L
         private const val WATCH_FLUSH_MS = 15_000L
-        private const val SESSION_TIMEOUT_MS = 120_000L  // forget "already counted" after 2 min away
-        private const val MAX_NODES = 250
-        private const val PROGRESS_SEARCH_INTERVAL_MS = 1500L
+        private const val MAX_SKIPPED = 4
         private const val MIN_HEIGHT_RATIO = 0.6f
         private const val MIN_WIDTH_RATIO = 0.8f
         private const val GESTURE_GAP_MS = 700L
-
         private const val NONE = Int.MIN_VALUE
-        private const val UNKNOWN = Int.MIN_VALUE + 1
     }
 }
