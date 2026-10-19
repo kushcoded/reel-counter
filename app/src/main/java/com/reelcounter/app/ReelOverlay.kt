@@ -75,11 +75,6 @@ class ReelOverlay(private val service: AccessibilityService) {
         if (over != lastOver) { view.setTextColor(if (over) OVER_LIMIT_RED else Color.WHITE); lastOver = over }
         if (bgAlpha != lastBgAlpha) { bgDrawable?.alpha = bgAlpha; lastBgAlpha = bgAlpha }
 
-        if (lastCount in 0 until count) {
-            view.animate().scaleX(1.25f).scaleY(1.25f).setDuration(90).withEndAction {
-                view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
-            }.start()
-        }
         lastCount = count
     }
 
@@ -108,9 +103,15 @@ class ReelOverlay(private val service: AccessibilityService) {
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dm = service.resources.displayMetrics
-                        params.x = (startX + (e.rawX - downX).toInt()).coerceIn(0, dm.widthPixels - view.width)
-                        params.y = (startY + (e.rawY - downY).toInt()).coerceIn(0, dm.heightPixels - view.height)
-                        try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+                        val maxX = (dm.widthPixels - view.width).coerceAtLeast(0)
+                        val maxY = (dm.heightPixels - view.height).coerceAtLeast(0)
+                        val x = (startX + (e.rawX - downX).toInt()).coerceIn(0, maxX)
+                        val y = (startY + (e.rawY - downY).toInt()).coerceIn(0, maxY)
+                        if (x != params.x || y != params.y) {
+                            params.x = x
+                            params.y = y
+                            try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+                        }
                         true
                     }
                     MotionEvent.ACTION_UP -> {

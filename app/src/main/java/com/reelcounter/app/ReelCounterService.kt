@@ -74,7 +74,8 @@ class ReelCounterService : AccessibilityService() {
     private var active: Platform? = null
     private var inFeed = false
     private var feedCheckedAt = 0L
-    private var feedMisses = 0      // consecutive "pager not found" checks; leaving needs two in a row
+    private var fallbackCheckedAt = 0L
+    private var feedMisses = 0      // consecutive "pager not found" checks; leaving needs several confirmations
     private var lastPollAt = 0L
 
     // The reel/short currently on screen
@@ -142,7 +143,10 @@ class ReelCounterService : AccessibilityService() {
                 // A fresh window in the same app can mean the accessibility tree was rebuilt.
                 // Force the next tick to re-check the feed instead of trusting cached state.
                 feedCheckedAt = 0L
-                if (active == src) syncOverlay() else setActive(src)
+                if (active == src) {
+                    updateTrackingStatus()
+                    syncOverlay()
+                } else setActive(src)
             }
             // Status bar, keyboard and our own accessibility overlay are transient windows.
             pkg == "com.android.systemui" || pkg == imePackage -> Unit
@@ -157,7 +161,8 @@ class ReelCounterService : AccessibilityService() {
      * tracked app becomes foreground again without another useful event. Verify the settled active root first.
      */
     private fun verifyForegroundAfterTransition() {
-        if (active == null) return
+        val current = active ?: return
+        TrackingStatus.update(TrackingState.TRANSITIONING, current)
         foregroundCheckJob?.cancel()
         foregroundCheckJob = scope.launch {
             delay(FOREGROUND_SETTLE_MS)
@@ -167,7 +172,10 @@ class ReelCounterService : AccessibilityService() {
                 when {
                     settled != null -> {
                         feedCheckedAt = 0L
-                        if (active != settled) setActive(settled) else syncOverlay()
+                        if (active != settled) setActive(settled) else {
+                            updateTrackingStatus()
+                            syncOverlay()
+                        }
                         return@launch
                     }
                     rootPkg == null || rootPkg == "com.android.systemui" || rootPkg == imePackage -> {
@@ -181,6 +189,7 @@ class ReelCounterService : AccessibilityService() {
             }
             // If Android never exposed a stable root, keep the current app state. The ticker will not count
             // against a mismatched root, and a later window event will settle the state safely.
+            updateTrackingStatus()
         }
     }
 
@@ -325,11 +334,13 @@ class ReelCounterService : AccessibilityService() {
         active = src
         inFeed = false
         feedCheckedAt = 0L
+        fallbackCheckedAt = 0L
         feedMisses = 0
         lastPollAt = 0L
         updateEventTypes(src != null)
         tickerJob?.cancel()
         tickerJob = if (src != null) scope.launch { while (isActive) delay(tick()) } else null
+        updateTrackingStatus()
         syncOverlay()
     }
 
@@ -343,7 +354,20 @@ class ReelCounterService : AccessibilityService() {
             endWatch(now)
             resetTracking(now)
         }
+        updateTrackingStatus()
         syncOverlay()
+    }
+
+    private fun updateTrackingStatus() {
+        val src = active
+        TrackingStatus.update(
+            when {
+                src == null -> TrackingState.IDLE
+                inFeed -> TrackingState.FEED_ACTIVE
+                else -> TrackingState.APP_ACTIVE
+            },
+            src
+        )
     }
 
     /**
@@ -355,13 +379,15 @@ class ReelCounterService : AccessibilityService() {
         val day = DayClock.today()
         if (day != lastDay) { lastDay = day; overlay.refresh() }   // new day: popup goes back to 0
         val now = SystemClock.uptimeMillis()
-        val polls = ids(src).readsPageKey
-        val root = if (polls) rootInActiveWindow else null          // one IPC shared by the checks below
+        val readsPageKey = ids(src).readsPageKey
+        // Page identity is the expensive part. Reuse a root at the faster rate only while actually in
+        // Shorts; outside the feed, regular once-per-second detection is enough.
+        val root = if (readsPageKey && inFeed) rootInActiveWindow else null
         refreshFeedState(src, now, root)
-        val interval = if (polls) POLL_MS else TICK_MS
+        val interval = if (readsPageKey && inFeed) POLL_MS else TICK_MS
         if (!inFeed) return interval
 
-        if (polls) pollPage(src, now, root)
+        if (readsPageKey) pollPage(src, now, root ?: rootInActiveWindow)
         accountWatch(now)
         if (watchPendingMs >= WATCH_FLUSH_MS) flushWatch()
 
@@ -374,23 +400,51 @@ class ReelCounterService : AccessibilityService() {
     /** Is the Reels/Shorts pager on screen? Cached, since each lookup is an IPC round trip. */
     private fun refreshFeedState(src: Platform, now: Long, preloaded: AccessibilityNodeInfo? = null) {
         if (now - feedCheckedAt < FEED_CACHE_MS) return
-        feedCheckedAt = now
         val root = preloaded ?: rootInActiveWindow ?: return
-        // A mismatched root is common for a few frames during app/window transitions. Do not turn it into
-        // a feed miss; foreground verification is responsible for deciding whether the app was really left.
+        // A mismatched root is common for a few frames during app/window transitions. Do not cache it and do
+        // not turn it into a feed miss; foreground verification decides whether the app was really left.
         if (root.packageName?.toString() != src.pkg) return
+        feedCheckedAt = now
+
         val pager = ids(src)
-        val found = pager.tabIds.any { id ->
+        var found = pager.tabIds.any { id ->
             root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").any { it.isSelected }
         } || pager.viewerIds.any { id ->
             root.findAccessibilityNodeInfosByViewId("${src.pkg}:id/$id").isNotEmpty()
         }
+
+        // App updates occasionally rename internal IDs. Only after repeated misses, and at a much lower
+        // frequency, fall back to stable accessibility labels such as a selected "Reels"/"Shorts" tab.
+        // The traversal is bounded, so it cannot turn into an unbounded tree scan.
+        if (!found && feedMisses >= 1 && now - fallbackCheckedAt >= FALLBACK_SCAN_MS) {
+            fallbackCheckedAt = now
+            found = hasSelectedFeedLabel(src, root)
+        }
+
         if (found) {
             feedMisses = 0
             setInFeed(true, now)
-        } else if (++feedMisses >= 2) {
+        } else if (++feedMisses >= FEED_MISSES_TO_LEAVE) {
             setInFeed(false, now)
         }
+    }
+
+    private fun hasSelectedFeedLabel(src: Platform, root: AccessibilityNodeInfo): Boolean {
+        val wanted = src.label
+        var visited = 0
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(root)
+        while (queue.isNotEmpty() && visited < MAX_FALLBACK_NODES) {
+            val node = queue.removeFirst()
+            visited++
+            if (node.isVisibleToUser && node.isSelected) {
+                val text = node.text?.toString()
+                val desc = node.contentDescription?.toString()
+                if (text.equals(wanted, ignoreCase = true) || desc.equals(wanted, ignoreCase = true)) return true
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let(queue::addLast)
+        }
+        return false
     }
 
     /** Ignores comment lists, carousels, etc. - the pager fills most of the screen. */
@@ -464,9 +518,12 @@ class ReelCounterService : AccessibilityService() {
     companion object {
         private const val TICK_MS = 1000L
         private const val MIN_WAKE_MS = 100L
-        private const val FEED_CACHE_MS = 700L
-        private const val POLL_MS = 600L          // how often a Shorts page is re-read
-        private const val EVENT_POLL_MS = 300L    // at most this often when scroll events wake the poll
+        private const val FEED_CACHE_MS = 750L
+        private const val POLL_MS = 800L          // Shorts page identity; enough for a 3s+ count threshold
+        private const val EVENT_POLL_MS = 400L    // scroll events may wake a read, but never faster than this
+        private const val FALLBACK_SCAN_MS = 2500L
+        private const val FEED_MISSES_TO_LEAVE = 3
+        private const val MAX_FALLBACK_NODES = 64
         private const val MAX_PAGE_NODES = 40
         private const val MAX_PAGE_TEXTS = 6
         private const val MIN_TEXT_LEN = 4

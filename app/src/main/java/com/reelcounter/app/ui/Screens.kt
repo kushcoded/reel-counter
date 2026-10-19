@@ -54,6 +54,8 @@ import com.reelcounter.app.Distance
 import com.reelcounter.app.Platform
 import com.reelcounter.app.ReelRepository
 import com.reelcounter.app.ReelCounterService
+import com.reelcounter.app.TrackingState
+import com.reelcounter.app.TrackingStatus
 import com.reelcounter.app.WatchTime
 import kotlinx.coroutines.delay
 import java.time.LocalDate
@@ -223,6 +225,7 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
+        TrackingStatusCard(serviceOn)
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
         WeekCard(counts, limit, today)
@@ -245,7 +248,7 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
                 count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
             )
-            Text("reels & shorts today", style = MaterialTheme.typography.bodyLarge)
+            Text("Reels & Shorts today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
                 progress = { min(1f, count.toFloat() / limit) },
@@ -254,7 +257,7 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (over) "${count - limit} over your limit of $limit" else "${limit - count} left of $limit",
+                if (over) "$count / $limit · ${count - limit} over limit" else "$count / $limit · ${limit - count} remaining",
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -268,7 +271,10 @@ private fun LimitCard(limit: Int) {
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CardTitle("Daily limit") {
+            CardTitle(
+                "Daily limit",
+                "Your limit applies to the combined Reels and Shorts count. It changes the progress display but does not block either app."
+            ) {
                 Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             }
             Button(onClick = { edit = true }, modifier = Modifier.fillMaxWidth()) { Text("Set limit") }
@@ -284,12 +290,12 @@ private fun LimitCard(limit: Int) {
         }
         AlertDialog(
             onDismissRequest = { edit = false },
-            title = { Text("Daily reel limit") },
+            title = { Text("Daily limit") },
             text = {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it.filter(Char::isDigit).take(5) },
-                    label = { Text("Reels & shorts per day") },
+                    label = { Text("Reels + Shorts per day") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
@@ -336,7 +342,7 @@ private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
                     }
                 }
             }
-            Text("Total $total  ·  avg ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
+            Text("Total $total  ·  Average ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -355,7 +361,7 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Average time per reel", style = MaterialTheme.typography.titleSmall)
+            Text("Average watch time", style = MaterialTheme.typography.titleSmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
@@ -368,12 +374,12 @@ private fun WatchTimeCard(
 private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     val info = buildString {
-        append("Distance = reels & shorts counted × scroll length per reel (1 short = 1 reel). Changing the length recalculates every day, including past ones.")
+        append("Estimated distance = counted Reels and Shorts × your chosen scroll length. Changing the length also recalculates past estimates.")
         fact.next?.let { append("\n\n").append(it) }
     }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CardTitle("Distance scrolled", info)
+            CardTitle("Estimated scroll distance", info)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
                 StatBlock("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
@@ -381,7 +387,7 @@ private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             HorizontalDivider()
             Text(
-                "Scroll length per reel: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
+                "Estimated scroll per video: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
                 style = MaterialTheme.typography.bodyMedium
             )
             Slider(
@@ -416,12 +422,11 @@ private fun PopupCard(count: Int, limit: Int) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
                 "Floating counter",
-                "Shows your count on top of Instagram, and on YouTube's Shorts screen. You can drag it anywhere on screen and it remembers where you left it. " +
-                        "Transparency only fades the dark background; the number stays solid."
+                "Shows a small draggable count over Instagram and YouTube Shorts. Its position is saved. Transparency affects only the background, not the number."
             ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
-            Text("Background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
+            Text("Popup background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
             // Live preview over a mid-tone backdrop, to show how the popup reads on top of video
             Box(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF7C8594)).padding(12.dp),
@@ -455,11 +460,11 @@ private fun WatchRuleCard() {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
-                "What counts as a reel",
-                "A reel or short counts once you've stayed on it for this many seconds. Scrolling back up and down never counts the same one twice."
+                "Counting rule",
+                "A Reel or Short counts after it stays on screen for this long. Revisiting the same item during the current feed session does not count it again."
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Time on a reel", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Text("Minimum watch time", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 OutlinedButton(onClick = { AppSettings.setSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
                 Text("$seconds s", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp))
                 OutlinedButton(onClick = { AppSettings.setSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
@@ -473,7 +478,7 @@ private fun WatchRuleCard() {
 private fun SourcesCard() {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            CardTitle("Count from", "Turning an app off stops all counting and the floating counter for it.")
+            CardTitle("Tracked apps", "Turn an app off to stop counting and hide the floating counter in that app.")
             Platform.entries.forEach { p ->
                 val on by AppSettings.tracking(p).collectAsStateWithLifecycle()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -497,6 +502,30 @@ private fun Footer() {
 }
 
 @Composable
+private fun TrackingStatusCard(serviceOn: Boolean) {
+    val snapshot by TrackingStatus.snapshot.collectAsStateWithLifecycle()
+    val (title, detail) = when {
+        !serviceOn -> "Tracking off" to "Enable the accessibility service to start counting."
+        snapshot.state == TrackingState.FEED_ACTIVE -> {
+            val p = snapshot.platform
+            "Tracking active" to if (p != null) "Counting ${p.appName} ${p.label}." else "Counting the current short-video feed."
+        }
+        snapshot.state == TrackingState.APP_ACTIVE -> {
+            val p = snapshot.platform
+            "App detected" to if (p != null) "${p.appName} is open. Waiting for ${p.label}." else "Waiting for a short-video feed."
+        }
+        snapshot.state == TrackingState.TRANSITIONING -> "Checking app" to "Verifying the active screen after an app switch."
+        else -> "Ready" to "Tracking starts automatically when you open Instagram Reels or YouTube Shorts."
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
 private fun SetupCard() {
     val ctx = LocalContext.current
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
@@ -506,7 +535,7 @@ private fun SetupCard() {
                 Text("Turn on the counter", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                "Enable Reel Counter in Accessibility settings so it can see which reel or short you're on. Everything stays on your phone.",
+                "Enable Reel Counter in Accessibility settings so it can recognize Reels and Shorts. Counts and watch time stay on this device.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
@@ -629,7 +658,15 @@ private fun StatCard(
 @Composable
 private fun rememberToday(): LocalDate {
     var today by remember { mutableStateOf(LocalDate.now()) }
-    LaunchedEffect(Unit) { while (true) { delay(30_000); today = LocalDate.now() } }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val now = java.time.ZonedDateTime.now()
+            val nextDay = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
+            val waitMs = java.time.Duration.between(now, nextDay).toMillis().coerceAtLeast(1_000L)
+            delay(waitMs)
+            today = LocalDate.now()
+        }
+    }
     return today
 }
 
