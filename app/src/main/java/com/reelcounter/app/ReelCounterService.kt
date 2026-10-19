@@ -67,6 +67,7 @@ class ReelCounterService : AccessibilityService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var overlay: ReelOverlay
     private var tickerJob: Job? = null
+    private var foregroundCheckJob: Job? = null
     private var imePackage: String? = null
 
     // Which tracked app is in the foreground, and whether its Reels/Shorts pager is on screen
@@ -136,11 +137,50 @@ class ReelCounterService : AccessibilityService() {
     private fun onWindowChanged(pkg: String, className: String?) {
         val src = trackedPlatform(pkg)
         when {
-            src != null -> if (active == src) syncOverlay() else setActive(src)
-            // Status bar, keyboard and our own overlay must not count as "left the app".
+            src != null -> {
+                foregroundCheckJob?.cancel()
+                // A fresh window in the same app can mean the accessibility tree was rebuilt.
+                // Force the next tick to re-check the feed instead of trusting cached state.
+                feedCheckedAt = 0L
+                if (active == src) syncOverlay() else setActive(src)
+            }
+            // Status bar, keyboard and our own accessibility overlay are transient windows.
             pkg == "com.android.systemui" || pkg == imePackage -> Unit
             pkg == packageName && className != MainActivity::class.java.name -> Unit
-            else -> setActive(null)
+            else -> verifyForegroundAfterTransition()
+        }
+    }
+
+    /**
+     * Window-state events briefly report launchers, permission surfaces and other intermediary windows while
+     * Android is switching apps. Resetting immediately can strand the service in an inactive state if the
+     * tracked app becomes foreground again without another useful event. Verify the settled active root first.
+     */
+    private fun verifyForegroundAfterTransition() {
+        if (active == null) return
+        foregroundCheckJob?.cancel()
+        foregroundCheckJob = scope.launch {
+            delay(FOREGROUND_SETTLE_MS)
+            repeat(FOREGROUND_CHECKS) { attempt ->
+                val rootPkg = rootInActiveWindow?.packageName?.toString()
+                val settled = trackedPlatform(rootPkg)
+                when {
+                    settled != null -> {
+                        feedCheckedAt = 0L
+                        if (active != settled) setActive(settled) else syncOverlay()
+                        return@launch
+                    }
+                    rootPkg == null || rootPkg == "com.android.systemui" || rootPkg == imePackage -> {
+                        if (attempt + 1 < FOREGROUND_CHECKS) delay(FOREGROUND_RETRY_MS)
+                    }
+                    else -> {
+                        setActive(null)
+                        return@launch
+                    }
+                }
+            }
+            // If Android never exposed a stable root, keep the current app state. The ticker will not count
+            // against a mismatched root, and a later window event will settle the state safely.
         }
     }
 
@@ -281,10 +321,12 @@ class ReelCounterService : AccessibilityService() {
         val now = SystemClock.uptimeMillis()
         endWatch(now)
         resetTracking(now)
+        foregroundCheckJob?.cancel()
         active = src
         inFeed = false
         feedCheckedAt = 0L
         feedMisses = 0
+        lastPollAt = 0L
         updateEventTypes(src != null)
         tickerJob?.cancel()
         tickerJob = if (src != null) scope.launch { while (isActive) delay(tick()) } else null
@@ -334,6 +376,8 @@ class ReelCounterService : AccessibilityService() {
         if (now - feedCheckedAt < FEED_CACHE_MS) return
         feedCheckedAt = now
         val root = preloaded ?: rootInActiveWindow ?: return
+        // A mismatched root is common for a few frames during app/window transitions. Do not turn it into
+        // a feed miss; foreground verification is responsible for deciding whether the app was really left.
         if (root.packageName?.toString() != src.pkg) return
         val pager = ids(src)
         val found = pager.tabIds.any { id ->
@@ -432,6 +476,9 @@ class ReelCounterService : AccessibilityService() {
         private const val MIN_HEIGHT_RATIO = 0.6f
         private const val MIN_WIDTH_RATIO = 0.8f
         private const val GESTURE_GAP_MS = 700L
+        private const val FOREGROUND_SETTLE_MS = 220L
+        private const val FOREGROUND_RETRY_MS = 180L
+        private const val FOREGROUND_CHECKS = 3
         private const val NONE = Int.MIN_VALUE        // not in a pager
         private const val UNKNOWN = Int.MIN_VALUE + 1 // in a pager, position not known yet
     }

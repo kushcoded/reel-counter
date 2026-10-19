@@ -297,10 +297,15 @@ private fun LimitCard(limit: Int) {
                 )
                 LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
             },
-            confirmButton = { TextButton(onClick = { save() }) { Text("Save") } },
-            dismissButton = {
-                TextButton(onClick = { AppSettings.setLimit(AppSettings.DEFAULT_LIMIT); edit = false }) { Text("Reset to ${AppSettings.DEFAULT_LIMIT}") }
-            }
+            confirmButton = {
+                Row {
+                    TextButton(onClick = { text = AppSettings.DEFAULT_LIMIT.toString() }) {
+                        Text("Use default")
+                    }
+                    TextButton(onClick = { save() }) { Text("Save") }
+                }
+            },
+            dismissButton = { TextButton(onClick = { edit = false }) { Text("Cancel") } }
         )
     }
 }
@@ -351,10 +356,9 @@ private fun WatchTimeCard(
             }
             HorizontalDivider()
             Text("Average time per reel", style = MaterialTheme.typography.titleSmall)
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
-                Spacer(Modifier.weight(1f))
             }
         }
     }
