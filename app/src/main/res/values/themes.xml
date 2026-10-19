@@ -1,3 +1,3 @@
 <resources>
-    <style name="Theme.ReelCounter" parent="@android:style/Theme.Material.Light.NoActionBar" />
+    <style name="Theme.ReelCounter" parent="@android:style/Theme.Material.NoActionBar" />
 </resources>
