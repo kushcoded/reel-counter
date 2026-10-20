@@ -117,7 +117,6 @@ object AppSettings {
     const val DEFAULT_CM_PER_REEL = 13.5f
     const val MIN_CM_PER_REEL = 10f
     const val MAX_CM_PER_REEL = 17f
-    private const val KEY_TRACK_HOME = "track_fyp"   // old key name, kept so saved settings survive
 
     private lateinit var prefs: SharedPreferences
     private val _overlayEnabled = MutableStateFlow(true)
@@ -128,7 +127,6 @@ object AppSettings {
     private val _darkTheme = MutableStateFlow(true)
     private val _trackReels = MutableStateFlow(true)
     private val _trackShorts = MutableStateFlow(true)
-    private val _trackHome = MutableStateFlow(false)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
     /** Daily limit (reels + shorts together); the popup turns red once today's count is above it. */
@@ -154,7 +152,6 @@ object AppSettings {
         _darkTheme.value = prefs.getBoolean("dark_theme", true)
         _trackReels.value = prefs.getBoolean("track_reels", true)
         _trackShorts.value = prefs.getBoolean("track_shorts", true)
-        _trackHome.value = prefs.getBoolean(KEY_TRACK_HOME, false)
     }
 
     /** Is counting switched on for this app? Off means the service ignores that app completely. */
@@ -168,18 +165,6 @@ object AppSettings {
             prefs.edit().putBoolean("track_reels", on).apply()
             _trackReels.value = on
         }
-    }
-
-    /**
-     * Beta: also count (and time) the reels that autoplay on Instagram's home page. Off by default; when off,
-     * the home page is ignored completely: only the dedicated Reels tab is counted and the floating counter
-     * shows only there.
-     */
-    val trackHome: StateFlow<Boolean> = _trackHome.asStateFlow()
-
-    fun setTrackHome(on: Boolean) {
-        prefs.edit().putBoolean(KEY_TRACK_HOME, on).apply()
-        _trackHome.value = on
     }
 
     fun setLimit(value: Int) {

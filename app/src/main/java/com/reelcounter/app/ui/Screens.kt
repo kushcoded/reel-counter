@@ -559,16 +559,6 @@ private fun SourcesCard() {
                     Text("${p.appName} ${p.label}", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                     Switch(checked = on, onCheckedChange = { AppSettings.setTracking(p, it) })
                 }
-                if (p == Platform.Reels) {
-                    val home by AppSettings.trackHome.collectAsStateWithLifecycle()
-                    Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Home page (beta)", style = MaterialTheme.typography.bodyLarge)
-                        Spacer(Modifier.width(2.dp))
-                        InfoButton("Home page (beta)", "Beta: counting on the home page may be inaccurate.")
-                        Spacer(Modifier.weight(1f))
-                        Switch(checked = home, enabled = on, onCheckedChange = { AppSettings.setTrackHome(it) })
-                    }
-                }
             }
         }
     }
