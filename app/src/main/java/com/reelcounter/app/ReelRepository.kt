@@ -59,11 +59,53 @@ class CountStore(private val countsFile: String, private val watchFile: String) 
     }
 }
 
+/**
+ * How many times each tracked app was opened per day, keyed "2026-10-20|Reels" (day, then [Platform.name]).
+ * One small write per open, so it costs nothing while the apps are in use.
+ */
+class OpenStore(private val file: String) {
+    private lateinit var prefs: SharedPreferences
+
+    private val _counts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val counts: StateFlow<Map<String, Int>> = _counts.asStateFlow()
+
+    @Synchronized
+    fun init(context: Context) {
+        if (::prefs.isInitialized) return
+        prefs = context.applicationContext.getSharedPreferences(file, Context.MODE_PRIVATE)
+        _counts.value = prefs.all.mapNotNull { (k, v) -> (v as? Int)?.let { k to it } }.toMap()
+    }
+
+    @Synchronized
+    fun increment(platform: Platform) {
+        val key = key(DayClock.today(), platform)
+        val updated = (_counts.value[key] ?: 0) + 1
+        prefs.edit().putInt(key, updated).apply()
+        _counts.value = _counts.value + (key to updated)
+    }
+
+    @Synchronized
+    fun clearAll() {
+        prefs.edit().clear().apply()
+        _counts.value = emptyMap()
+    }
+
+    companion object {
+        fun key(day: String, platform: Platform) = "$day|${platform.name}"
+    }
+}
+
 object ReelRepository {
     /** Reels and Shorts are merged into one store (1 short = 1 reel). Original file names keep existing history. */
     val store = CountStore("reel_counts", "watch_time")
 
-    fun init(context: Context) = store.init(context)
+    /** App opens per day and app (Instagram, YouTube). */
+    val opens = OpenStore("app_opens")
+
+    fun init(context: Context) {
+        store.init(context)
+        opens.init(context)
+    }
 }
 
 /** User settings + remembered position of the floating counter. */
@@ -85,6 +127,7 @@ object AppSettings {
     private val _darkTheme = MutableStateFlow(true)
     private val _trackReels = MutableStateFlow(true)
     private val _trackShorts = MutableStateFlow(true)
+    private val _trackFyp = MutableStateFlow(false)
 
     val overlayEnabled: StateFlow<Boolean> = _overlayEnabled.asStateFlow()
     /** Daily limit (reels + shorts together); the popup turns red once today's count is above it. */
@@ -110,6 +153,7 @@ object AppSettings {
         _darkTheme.value = prefs.getBoolean("dark_theme", true)
         _trackReels.value = prefs.getBoolean("track_reels", true)
         _trackShorts.value = prefs.getBoolean("track_shorts", true)
+        _trackFyp.value = prefs.getBoolean("track_fyp", false)
     }
 
     /** Is counting switched on for this app? Off means the service ignores that app completely. */
@@ -123,6 +167,17 @@ object AppSettings {
             prefs.edit().putBoolean("track_reels", on).apply()
             _trackReels.value = on
         }
+    }
+
+    /**
+     * Beta: also count (and time) the reels that autoplay in Instagram's ordinary home feed, the FYP. Off by
+     * default; when off, only the dedicated Reels tab is counted and the floating counter shows only there.
+     */
+    val trackFyp: StateFlow<Boolean> = _trackFyp.asStateFlow()
+
+    fun setTrackFyp(on: Boolean) {
+        prefs.edit().putBoolean("track_fyp", on).apply()
+        _trackFyp.value = on
     }
 
     fun setLimit(value: Int) {

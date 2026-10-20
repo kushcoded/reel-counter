@@ -52,6 +52,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.reelcounter.app.AppSettings
 import com.reelcounter.app.Distance
+import com.reelcounter.app.OpenStore
 import com.reelcounter.app.Platform
 import com.reelcounter.app.ReelRepository
 import com.reelcounter.app.ReelCounterService
@@ -111,6 +112,7 @@ fun AppRoot() {
     var confirmClear by remember { mutableStateOf(false) }
     val counts by ReelRepository.store.counts.collectAsStateWithLifecycle()
     val watch by ReelRepository.store.watchMs.collectAsStateWithLifecycle()
+    val opens by ReelRepository.opens.counts.collectAsStateWithLifecycle()
     val limit by AppSettings.limit.collectAsStateWithLifecycle()
     val cmPerReel by AppSettings.cmPerReel.collectAsStateWithLifecycle()
     val dark by AppSettings.darkTheme.collectAsStateWithLifecycle()
@@ -147,7 +149,7 @@ fun AppRoot() {
             }
         }
     ) { padding ->
-        if (tab == 0) HomeScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
+        if (tab == 0) HomeScreen(counts, watch, opens, limit, cmPerReel, Modifier.padding(padding))
         else HistoryScreen(counts, watch, limit, cmPerReel, Modifier.padding(padding))
     }
 
@@ -155,9 +157,13 @@ fun AppRoot() {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("Clear all history?") },
-            text = { Text("This deletes every daily total and all watch time.") },
+            text = { Text("This deletes every daily total, all watch time and all app-open counts.") },
             confirmButton = {
-                TextButton(onClick = { ReelRepository.store.clearAll(); confirmClear = false }) { Text("Clear") }
+                TextButton(onClick = {
+                    ReelRepository.store.clearAll()
+                    ReelRepository.opens.clearAll()
+                    confirmClear = false
+                }) { Text("Clear") }
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
         )
@@ -223,7 +229,10 @@ private fun CardTitle(title: String, info: String? = null, trailing: @Composable
 // ---------------------------------------------------------------------------- Today tab
 
 @Composable
-fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, cmPerReel: Float, modifier: Modifier = Modifier) {
+fun HomeScreen(
+    counts: Map<String, Int>, watch: Map<String, Long>, opens: Map<String, Int>,
+    limit: Int, cmPerReel: Float, modifier: Modifier = Modifier
+) {
     val today = rememberToday()
     val todayCount = counts[today.toString()] ?: 0
     val totalReels = remember(counts) { counts.values.sum() }
@@ -247,6 +256,7 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         LimitCard(limit)
         WeekCard(counts, limit, today)
         WatchTimeCard(todayWatch, totalWatch, totalWatch / watchDays, todayCount, reelsOnWatchedDays)
+        OpensCard(opens, today)
         DistanceCard(todayCount, totalReels, cmPerReel)
         PopupCard(todayCount, limit)
         WatchRuleCard()
@@ -380,10 +390,55 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Average watch time", style = MaterialTheme.typography.titleSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Average view duration", style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.width(2.dp))
+                InfoButton(
+                    "Average view duration",
+                    "How long you stay on a typical reel or short: your watch time divided by the number of " +
+                        "reels counted. A low number means you flick through quickly; a high one means you linger.\n\n" +
+                        "Today uses today's watch time and reels. All time only uses days that have watch time " +
+                        "recorded, so history from before watch time existed doesn't skew it. Reels you skip " +
+                        "past quickly add a little time but aren't counted, so the figure reads slightly high."
+                )
+            }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
+            }
+        }
+    }
+}
+
+/** How often each app was opened: today and all time. */
+@Composable
+private fun OpensCard(opens: Map<String, Int>, today: LocalDate) {
+    val todayKey = today.toString()
+    // One pass over the stored days: the all-time total of every app.
+    val allTime = remember(opens) {
+        val sums = IntArray(Platform.entries.size)
+        for ((key, value) in opens) {
+            val name = key.substringAfter('|', "")
+            Platform.entries.firstOrNull { it.name == name }?.let { sums[it.ordinal] += value }
+        }
+        sums
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            CardTitle(
+                "Times opened",
+                "How many times Instagram and YouTube came to the front. Coming straight back within 10 seconds " +
+                    "(after the share sheet, say) is the same visit, but unlocking your phone back into the app " +
+                    "counts as a new open. An app is only counted while its switch under Tracked apps is on and " +
+                    "the counter service is running."
+            )
+            Platform.entries.forEachIndexed { i, p ->
+                if (i > 0) HorizontalDivider()
+                Text(p.appName, style = MaterialTheme.typography.titleSmall)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    StatBlock("Today", (opens[OpenStore.key(todayKey, p)] ?: 0).toString(), Modifier.weight(1f), compact = true)
+                    StatBlock("All time", allTime[p.ordinal].toString(), Modifier.weight(1f), compact = true)
+                }
             }
         }
     }
@@ -503,6 +558,27 @@ private fun SourcesCard() {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("${p.appName} ${p.label}", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                     Switch(checked = on, onCheckedChange = { AppSettings.setTracking(p, it) })
+                }
+                if (p == Platform.Reels) {
+                    val fyp by AppSettings.trackFyp.collectAsStateWithLifecycle()
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Instagram FYP (beta)", style = MaterialTheme.typography.bodyLarge)
+                        Spacer(Modifier.width(2.dp))
+                        InfoButton(
+                            "Instagram FYP (beta)",
+                            "Beta feature. It reads Instagram's home feed while you scroll it, to count the reels that " +
+                                "autoplay there and to time how long you watch them.\n\n" +
+                                "It is less reliable than the Reels tab: photos, ads and carousels can occasionally be " +
+                                "mistaken for reels or the other way round, it may stop working after an Instagram " +
+                                "update, and it uses a little more battery while you scroll the feed. If your numbers " +
+                                "look off, turn it off.\n\n" +
+                                "Off (the default): only the Reels tab is counted, and the floating counter shows " +
+                                "only there. On: reels in the home feed are counted and the counter shows throughout " +
+                                "Instagram."
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Switch(checked = fyp, enabled = on, onCheckedChange = { AppSettings.setTrackFyp(it) })
+                    }
                 }
             }
         }

@@ -36,6 +36,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * leave the Reels/Shorts screen or the app, so a fresh session is never skipped.
  *
  * An app switched off in the settings is ignored completely: no counting, no popup, no scroll events.
+ * Instagram's home feed (FYP) is a separate beta switch, off by default; the dedicated Reels tab is always counted.
+ * Watch time is timed in the Reels/Shorts pagers and, with FYP on, while a video is on screen in the home feed.
+ * Each time a tracked app comes to the front is recorded as an "open".
  *
  * Built to run 24/7:
  *  - With no tracked app open there is no timer, no scroll subscription and no tree access at all.
@@ -62,21 +65,34 @@ class ReelCounterService : AccessibilityService() {
          */
         val readsPageKey: Boolean,
         /**
-         * true: also count reels/videos that autoplay in the app's ordinary home feed (Instagram's FYP),
-         * not only inside the dedicated Reels pager.
+         * true: the app has an ordinary home feed whose autoplaying reels/videos can be counted too (Instagram's
+         * FYP). Only active while the user's FYP (beta) switch is on, see [homeFeedOn].
          */
         val homeFeed: Boolean
     )
 
-    private fun ids(p: Platform) = when (p) {
-        Platform.Reels -> PagerIds(
-            listOf("clips_tab"), listOf("clips_viewer_view_pager"),
-            popupEverywhere = true, readsPageKey = false, homeFeed = true
-        )
-        Platform.Shorts -> PagerIds(
-            emptyList(), listOf("reel_recycler", "reel_player_page_container", "reel_watch_fragment_root"),
-            popupEverywhere = false, readsPageKey = true, homeFeed = false
-        )
+    // Built once: [ids] is called for every scroll event, which must not allocate.
+    private val reelsIds = PagerIds(
+        listOf("clips_tab"), listOf("clips_viewer_view_pager"),
+        popupEverywhere = true, readsPageKey = false, homeFeed = true
+    )
+    private val shortsIds = PagerIds(
+        emptyList(), listOf("reel_recycler", "reel_player_page_container", "reel_watch_fragment_root"),
+        popupEverywhere = false, readsPageKey = true, homeFeed = false
+    )
+
+    private fun ids(p: Platform) = if (p == Platform.Shorts) shortsIds else reelsIds
+
+    /** Is home-feed (FYP) counting on for this app? It needs the app to have one and the beta switch to be on. */
+    private fun homeFeedOn(p: Platform) = ids(p).homeFeed && AppSettings.trackFyp.value
+
+    /**
+     * Show the floating counter on every screen of the app, or only inside the Reels/Shorts pager? Instagram's
+     * follows the FYP switch: the counter belongs wherever reels are being counted.
+     */
+    private fun popupEverywhere(p: Platform): Boolean {
+        val pager = ids(p)
+        return pager.popupEverywhere && (!pager.homeFeed || AppSettings.trackFyp.value)
     }
 
     // The handler is a last-resort safety net: an uncaught exception in a coroutine on the main thread would
@@ -106,6 +122,7 @@ class ReelCounterService : AccessibilityService() {
     // Instagram home feed: reels inside the ordinary feed, read while the user is scrolling it
     private var inHome = false
     private var homeNeedsRead = false
+    private var homeMisses = 0           // consecutive home-feed reads that could not identify the item on screen
 
     // The reel/short currently on screen
     private var currentIndex = NONE
@@ -115,6 +132,10 @@ class ReelCounterService : AccessibilityService() {
     private var pseudoIndex = 0
     private var lastScrollAt = 0L        // last scroll that reached the counting logic (gesture detection)
     private var lastDay = ""
+
+    // When each app was last left (elapsedRealtime, so it also advances while the phone sleeps); 0 = never.
+    // Used to avoid counting a quick return (share sheet, permission dialog) as a second "open".
+    private val lastLeftAt = LongArray(Platform.entries.size)
 
     // Watch time: accumulated in memory, written to disk in batches
     private var watchMark = 0L           // uptime up to which time has been accounted; 0 = not watching
@@ -177,13 +198,15 @@ class ReelCounterService : AccessibilityService() {
         }
         scope.launch {
             combine(
-                AppSettings.overlayEnabled, AppSettings.tracking(Platform.Reels), AppSettings.tracking(Platform.Shorts)
-            ) { _, _, _ -> }.collect { runCatching { onSettingsChanged() } }
+                AppSettings.overlayEnabled, AppSettings.tracking(Platform.Reels),
+                AppSettings.tracking(Platform.Shorts), AppSettings.trackFyp
+            ) { _, _, _, _ -> }.collect { runCatching { onSettingsChanged() } }
         }
 
         TrackingStatus.update(TrackingState.IDLE, null)   // never show state left over from a previous run
         updateEventTypes(appOpen = false)   // scroll events only matter while a tracked app is open
-        trackedPlatform(rootInActiveWindow?.packageName?.toString())?.let { setActive(it) }
+        // The app that is already in front when the service (re)connects was not just opened.
+        trackedPlatform(rootInActiveWindow?.packageName?.toString())?.let { setActive(it, countOpen = false) }
     }
 
     private fun refreshImePackage() {
@@ -289,7 +312,11 @@ class ReelCounterService : AccessibilityService() {
     /** A switch was flipped (or the popup toggled): stop everything for an app that was just turned off. */
     private fun onSettingsChanged() {
         val a = active
-        if (a != null && !AppSettings.tracking(a).value) setActive(null) else syncOverlay()
+        if (a != null && !AppSettings.tracking(a).value) { setActive(null); return }
+        // FYP switched off while its feed was being read: stop reading it and stop timing its video.
+        if (a != null && !homeFeedOn(a)) pauseHome(SystemClock.uptimeMillis())
+        syncOverlay()
+        if (a != null && homeFeedOn(a)) wake()
     }
 
     private fun onScroll(event: AccessibilityEvent) {
@@ -302,8 +329,11 @@ class ReelCounterService : AccessibilityService() {
 
         if (!inFeed) {
             // Instagram home feed: just note that something moved; the ticker reads the page once it settles.
-            if (pager.homeFeed) {
+            if (homeFeedOn(src)) {
                 homeNeedsRead = true
+                // Scrolling: which item is on screen is unknown until it settles, so stop timing for now.
+                // (The time up to this moment is still credited.) The next read restarts it if it is a video.
+                if (burstStart && watchMark != 0L) { accountWatch(now); watchMark = 0L }
                 if (!inHome || burstStart) wake()
             }
             return
@@ -401,14 +431,19 @@ class ReelCounterService : AccessibilityService() {
     private fun enterHome(now: Long) {
         inHome = true
         homeNeedsRead = true
+        homeMisses = 0
         startReel(UNKNOWN, now)
         updateTrackingStatus()
     }
 
-    /** Scrolling stopped for a while: stop reading the screen. Already counted items stay remembered. */
+    /**
+     * Stop reading the home feed (scrolling stopped and no video is being watched, FYP switched off, or the
+     * dedicated Reels pager took over). Already counted items stay remembered.
+     */
     private fun pauseHome(now: Long) {
         if (!inHome) return
         countIfDue(now)
+        endWatch(now)   // a video rested on in the home feed was being timed
         inHome = false
         homeNeedsRead = false
         currentIndex = NONE
@@ -419,14 +454,19 @@ class ReelCounterService : AccessibilityService() {
 
     /**
      * Periodic part of home-feed counting. The page is read only once the scroll has settled and only if
-     * something scrolled since the last read, so resting on a reel costs nothing. Returns how long to sleep.
+     * something scrolled since the last read. While a video is on screen the time is counted, and every
+     * [HOME_VERIFY_MS] a cheap read checks it is still the item in the middle (the user may have left it without
+     * scrolling). Returns how long to sleep.
      */
     private fun tickHome(src: Platform, now: Long): Long {
         val sinceScroll = now - lastSeenScrollAt
-        if (sinceScroll >= HOME_ACTIVE_MS) { pauseHome(now); return OUT_TICK_MS }
+        // Without a video on screen, stop reading a few seconds after the last scroll. With one, keep going
+        // (slowly) so that resting on it still adds to the watch time.
+        if (sinceScroll >= HOME_ACTIVE_MS && watchMark == 0L) { pauseHome(now); return OUT_TICK_MS }
         if (!inHome) enterHome(now)
+        if (!homeNeedsRead && watchMark != 0L && now - lastPollAt >= HOME_VERIFY_MS) homeNeedsRead = true
 
-        var sleep = HOME_IDLE_TICK_MS
+        var sleep = if (watchMark != 0L) HOME_REST_TICK_MS else HOME_IDLE_TICK_MS
         if (homeNeedsRead) {
             if (sinceScroll >= SETTLE_MS) {
                 pollHome(src, now)
@@ -435,17 +475,29 @@ class ReelCounterService : AccessibilityService() {
                 sleep = (SETTLE_MS - sinceScroll).coerceAtLeast(MIN_WAKE_MS)
             }
         }
+        accountWatch(now)
+        if (watchPendingMs >= WATCH_FLUSH_MS) flushWatch()
         countIfDue(now)
         return dwellWake(now, sleep)
     }
 
     private fun pollHome(src: Platform, now: Long) {
         lastPollAt = now
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != src.pkg) return
-        val key = scanner.readHomeKey(root, now, lastSeenScrollAt) ?: return
+        val root = rootInActiveWindow
+        val key = if (root != null && root.packageName?.toString() == src.pkg) {
+            scanner.readHomeKey(root, now, lastSeenScrollAt)
+        } else null
+        if (key == null) {
+            // Cannot tell what is on screen. If that keeps happening while a video is being timed, the user has
+            // most likely left it (another screen), so stop timing rather than guess.
+            if (++homeMisses >= HOME_MISSES_TO_STOP && watchMark != 0L) endWatch(now)
+            return
+        }
         homeNeedsRead = false
+        homeMisses = 0
         observePage(key, now)
+        // A video on screen is timed from now on; anything else (photo, grid, comments, other screen) is not.
+        if (key == NON_VIDEO) endWatch(now) else if (watchMark == 0L) watchMark = now
     }
 
     /** Forget the current pager session. Called when leaving the pager or the app. */
@@ -453,6 +505,7 @@ class ReelCounterService : AccessibilityService() {
         countIfDue(now)   // a reel watched long enough right before leaving still counts
         inHome = false
         homeNeedsRead = false
+        homeMisses = 0
         if (::scanner.isInitialized) scanner.reset()
         currentIndex = NONE
         currentCounted = false
@@ -462,9 +515,17 @@ class ReelCounterService : AccessibilityService() {
 
     // ------------------------------------------------------------------ state
 
-    private fun setActive(src: Platform?) {
+    private fun setActive(src: Platform?, countOpen: Boolean = true) {
         if (active == src) return
         val now = SystemClock.uptimeMillis()
+        val wall = SystemClock.elapsedRealtime()
+        active?.let { lastLeftAt[it.ordinal] = wall }
+        if (src != null && countOpen) {
+            // One "open" each time the app comes to the front. Coming straight back (share sheet, a permission
+            // dialog, a quick glance elsewhere) is the same visit.
+            val left = lastLeftAt[src.ordinal]
+            if (left == 0L || wall - left >= OPEN_GAP_MS) ReelRepository.opens.increment(src)
+        }
         endWatch(now)
         resetTracking(now)
         foregroundCheckJob?.cancel()
@@ -556,7 +617,7 @@ class ReelCounterService : AccessibilityService() {
         // Share one root between the feed check and the Shorts page read.
         val root = if (pager.readsPageKey && inFeed) rootInActiveWindow else null
         refreshFeedState(src, now, root)
-        if (!inFeed) return if (pager.homeFeed) tickHome(src, now) else OUT_TICK_MS
+        if (!inFeed) return if (homeFeedOn(src)) tickHome(src, now) else OUT_TICK_MS
 
         val interval: Long
         if (pager.readsPageKey) {
@@ -636,7 +697,7 @@ class ReelCounterService : AccessibilityService() {
 
     private fun syncOverlay() {
         val src = active
-        if (src != null && AppSettings.overlayEnabled.value && (ids(src).popupEverywhere || inFeed)) overlay.show()
+        if (src != null && AppSettings.overlayEnabled.value && (popupEverywhere(src) || inFeed)) overlay.show()
         else overlay.hide()
     }
 
@@ -689,7 +750,10 @@ class ReelCounterService : AccessibilityService() {
         private const val OUT_TICK_MS = 2500L         // tracked app open, but not in a feed
         private const val POLL_MS = 800L              // Shorts page read / home-feed retry while scrolling
         private const val IDLE_POLL_MS = 1500L        // Shorts page read while resting
-        private const val HOME_IDLE_TICK_MS = 1200L
+        private const val HOME_IDLE_TICK_MS = 1200L  // home feed: reading after a scroll
+        private const val HOME_REST_TICK_MS = 2000L  // home feed: resting on a video (must stay under MAX_WATCH_GAP_MS)
+        private const val HOME_VERIFY_MS = 4000L     // home feed: how often to re-check a rested-on video
+        private const val HOME_MISSES_TO_STOP = 4
         private const val SETTLE_MS = 250L            // a scroll counts as finished after this long
         private const val MIN_WAKE_MS = 100L
         private const val POLL_SLACK_MS = 100L
@@ -715,6 +779,7 @@ class ReelCounterService : AccessibilityService() {
         private const val MAX_WATCH_GAP_MS = 3000L
         private const val WATCH_FLUSH_MS = 15_000L
         private const val MAX_COUNTED = 4000
+        private const val OPEN_GAP_MS = 10_000L       // returning within this is the same visit, not a new open
 
         private const val TAG = "ReelCounter"
         private const val SYSTEM_UI = "com.android.systemui"
