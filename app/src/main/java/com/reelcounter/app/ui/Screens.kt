@@ -302,7 +302,7 @@ private fun LimitCard(limit: Int) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             CardTitle(
                 "Daily limit",
-                "Your limit applies to the combined Reels and Shorts count. It changes the progress display but does not block either app."
+                "Your limit applies to the combined Reels and Shorts count. It will delete instagram and youtube automatically when exceeded /j"
             ) {
                 Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             }
@@ -396,10 +396,8 @@ private fun WatchTimeCard(
                 InfoButton(
                     "Average view duration",
                     "How long you stay on a typical reel or short: your watch time divided by the number of " +
-                        "reels counted. A low number means you flick through quickly; a high one means you linger.\n\n" +
-                        "Today uses today's watch time and reels. All time only uses days that have watch time " +
-                        "recorded, so history from before watch time existed doesn't skew it. Reels you skip " +
-                        "past quickly add a little time but aren't counted, so the figure reads slightly high."
+                        "reels counted. A low number means you have the attention span of a goldfish; a high one means you are a Gigachad.\n\n" +
+                        "Reels you skip past quickly add a little time but aren't counted, so the figure reads slightly high."
                 )
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -428,7 +426,7 @@ private fun OpensCard(opens: Map<String, Int>, today: LocalDate) {
             CardTitle(
                 "Times opened",
                 "How many times Instagram and YouTube came to the front. Coming straight back within 10 seconds " +
-                    "(after the share sheet, say) is the same visit, but unlocking your phone back into the app " +
+                    "is the same visit, but unlocking your phone back into the app " +
                     "counts as a new open. An app is only counted while its switch under Tracked apps is on and " +
                     "the counter service is running."
             )
@@ -496,7 +494,7 @@ private fun PopupCard(count: Int, limit: Int) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
                 "Floating counter",
-                "Shows a small draggable count over Instagram and YouTube Shorts. Its position is saved. Transparency affects only the background, not the number."
+                "Shows a small draggable count over Instagram and YouTube Shorts. Its position is saved."
             ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
@@ -567,7 +565,7 @@ private fun SourcesCard() {
 @Composable
 private fun Footer() {
     Text(
-        "Licensed under GPLv3.0",
+        "v1.3  .  Licensed under GPLv3.0",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,
