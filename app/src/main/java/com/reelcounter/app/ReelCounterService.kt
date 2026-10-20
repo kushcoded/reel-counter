@@ -5,12 +5,15 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,7 +79,12 @@ class ReelCounterService : AccessibilityService() {
         )
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    // The handler is a last-resort safety net: an uncaught exception in a coroutine on the main thread would
+    // otherwise crash the process, and a crashing accessibility service can get switched off by the system.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Main.immediate +
+            CoroutineExceptionHandler { _, e -> Log.e(TAG, "Background task failed", e) }
+    )
     private lateinit var overlay: ReelOverlay
     private lateinit var scanner: PageScanner
     private var tickerJob: Job? = null
@@ -112,31 +120,65 @@ class ReelCounterService : AccessibilityService() {
     private var watchMark = 0L           // uptime up to which time has been accounted; 0 = not watching
     private var watchPendingMs = 0L
 
-    private val screenOffReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) = setActive(null)
+    /**
+     * Screen off stops everything (no ticker while the phone sleeps). Screen on / unlock re-detects the foreground
+     * app, because Android does not always send a window event for an app that was simply waiting behind the lock
+     * screen. Clock and timezone changes drop the cached "today", which would otherwise stay stale until midnight.
+     */
+    private val systemReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            try {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> setActive(null)
+                    Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> settleForeground(WAKE_CHECKS)
+                    Intent.ACTION_TIME_CHANGED, Intent.ACTION_TIMEZONE_CHANGED, Intent.ACTION_DATE_CHANGED ->
+                        onClockChanged()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "System broadcast handling failed", e)
+            }
+        }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         scope.coroutineContext.cancelChildren()
-        runCatching { unregisterReceiver(screenOffReceiver) }
+        tickerJob = null
+        foregroundCheckJob = null
+        if (::scanner.isInitialized) {
+            // Reconnected without a destroy in between: save what we have and drop every piece of stale state,
+            // otherwise `active` would still be set while its ticker is gone and counting would never restart.
+            val now = SystemClock.uptimeMillis()
+            endWatch(now)
+            resetTracking(now)
+        }
+        if (::overlay.isInitialized) overlay.hide()
+        active = null
+        inFeed = false
+        lastDay = ""
+        runCatching { unregisterReceiver(systemReceiver) }
         ReelRepository.init(this)
         AppSettings.init(this)
         overlay = ReelOverlay(this)
         scanner = PageScanner(resources)
-        imePackage = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
-            ?.substringBefore('/')
-        ContextCompat.registerReceiver(
-            this, screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+        refreshImePackage()
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+            addAction(Intent.ACTION_DATE_CHANGED)
+        }
+        ContextCompat.registerReceiver(this, systemReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         scope.launch {
             combine(ReelRepository.store.counts, AppSettings.limit, AppSettings.transparency) { _, _, _ -> }
-                .collect { overlay.refresh() }
+                .collect { runCatching { overlay.refresh() } }
         }
         scope.launch {
             combine(
                 AppSettings.overlayEnabled, AppSettings.tracking(Platform.Reels), AppSettings.tracking(Platform.Shorts)
-            ) { _, _, _ -> }.collect { onSettingsChanged() }
+            ) { _, _, _ -> }.collect { runCatching { onSettingsChanged() } }
         }
 
         TrackingStatus.update(TrackingState.IDLE, null)   // never show state left over from a previous run
@@ -144,13 +186,32 @@ class ReelCounterService : AccessibilityService() {
         trackedPlatform(rootInActiveWindow?.packageName?.toString())?.let { setActive(it) }
     }
 
+    private fun refreshImePackage() {
+        imePackage = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+            ?.substringBefore('/')
+    }
+
+    private fun onClockChanged() {
+        DayClock.invalidate()
+        lastDay = ""
+        if (::overlay.isInitialized) overlay.refresh()
+    }
+
     // ------------------------------------------------------------------ events
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        val pkg = event.packageName?.toString() ?: return
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> onWindowChanged(pkg, event.className?.toString())
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> if (pkg == active?.pkg) onScroll(event)
+        // Reading another app's tree can throw (stale nodes, dead binder, app being killed). Nothing here may
+        // escape, or the whole process dies and the 24/7 service goes with it.
+        try {
+            val pkg = event.packageName?.toString() ?: return
+            when (event.eventType) {
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> onWindowChanged(pkg, event.className?.toString())
+                AccessibilityEvent.TYPE_VIEW_SCROLLED -> if (pkg == active?.pkg) onScroll(event)
+            }
+            ensureTicker()
+        } catch (e: Exception) {
+            Log.e(TAG, "Event handling failed", e)
+            recoverFromError()
         }
     }
 
@@ -172,7 +233,7 @@ class ReelCounterService : AccessibilityService() {
                 } else setActive(src)
             }
             // Status bar, keyboard and our own accessibility overlay are transient windows.
-            pkg == "com.android.systemui" || pkg == imePackage -> Unit
+            pkg == SYSTEM_UI || pkg == imePackage -> Unit
             pkg == packageName && className != MainActivity::class.java.name -> Unit
             else -> verifyForegroundAfterTransition()
         }
@@ -186,10 +247,19 @@ class ReelCounterService : AccessibilityService() {
     private fun verifyForegroundAfterTransition() {
         val current = active ?: return
         TrackingStatus.update(TrackingState.TRANSITIONING, current)
+        refreshImePackage()   // the user may have switched keyboard since the service started
+        settleForeground(FOREGROUND_CHECKS)
+    }
+
+    /**
+     * Wait for Android to expose a stable active window, then make the service state match it: start tracking if
+     * a tracked app is in front, stop if some other app is. Used after app switches and after the screen comes on.
+     */
+    private fun settleForeground(checks: Int) {
         foregroundCheckJob?.cancel()
         foregroundCheckJob = scope.launch {
             delay(FOREGROUND_SETTLE_MS)
-            repeat(FOREGROUND_CHECKS) { attempt ->
+            repeat(checks) { attempt ->
                 val rootPkg = rootInActiveWindow?.packageName?.toString()
                 val settled = trackedPlatform(rootPkg)
                 when {
@@ -201,8 +271,8 @@ class ReelCounterService : AccessibilityService() {
                         }
                         return@launch
                     }
-                    rootPkg == null || rootPkg == "com.android.systemui" || rootPkg == imePackage -> {
-                        if (attempt + 1 < FOREGROUND_CHECKS) delay(FOREGROUND_RETRY_MS)
+                    rootPkg == null || rootPkg == SYSTEM_UI || rootPkg == imePackage -> {
+                        if (attempt + 1 < checks) delay(FOREGROUND_RETRY_MS)
                     }
                     else -> {
                         setActive(null)
@@ -406,12 +476,8 @@ class ReelCounterService : AccessibilityService() {
         lastPollAt = 0L
         updateEventTypes(src != null)
         tickerJob?.cancel()
-        tickerJob = if (src != null) scope.launch {
-            while (isActive) {
-                val sleep = tick()
-                withTimeoutOrNull(sleep) { wakeTicker.receive() }
-            }
-        } else null
+        tickerJob = null
+        if (src != null) startTicker()
         updateTrackingStatus()
         syncOverlay()
     }
@@ -433,6 +499,33 @@ class ReelCounterService : AccessibilityService() {
     }
 
     private fun wake() { wakeTicker.trySend(Unit) }
+
+    private fun startTicker() {
+        tickerJob?.cancel()
+        tickerJob = scope.launch {
+            while (isActive) {
+                val sleep = try {
+                    tick()
+                } catch (e: Exception) {
+                    // One bad read must not end the loop for good: drop cached nodes, back off, carry on.
+                    Log.e(TAG, "Tick failed", e)
+                    recoverFromError()
+                    ERROR_TICK_MS
+                }
+                withTimeoutOrNull(sleep) { wakeTicker.receive() }
+            }
+        }
+    }
+
+    /** Watchdog: if a tracked app is active but the ticker is gone for any reason, bring it back. */
+    private fun ensureTicker() {
+        if (active != null && tickerJob?.isActive != true) startTicker()
+    }
+
+    private fun recoverFromError() {
+        if (::scanner.isInitialized) scanner.reset()
+        feedCheckedAt = 0L
+    }
 
     private fun updateTrackingStatus() {
         val src = active
@@ -560,9 +653,18 @@ class ReelCounterService : AccessibilityService() {
 
     override fun onInterrupt() = Unit
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Rotation or display-size change: keep the floating counter reachable.
+        if (::overlay.isInitialized) overlay.keepOnScreen()
+    }
+
     override fun onUnbind(intent: Intent?): Boolean {
         if (::overlay.isInitialized) overlay.hide()
         foregroundCheckJob?.cancel()
+        tickerJob?.cancel()
+        tickerJob = null
+        active = null
         val now = SystemClock.uptimeMillis()
         resetTracking(now)
         endWatch(now)
@@ -571,7 +673,8 @@ class ReelCounterService : AccessibilityService() {
     }
 
     override fun onDestroy() {
-        runCatching { unregisterReceiver(screenOffReceiver) }
+        runCatching { unregisterReceiver(systemReceiver) }
+        if (::overlay.isInitialized) overlay.hide()
         val now = SystemClock.uptimeMillis()
         resetTracking(now)
         endWatch(now)
@@ -612,6 +715,11 @@ class ReelCounterService : AccessibilityService() {
         private const val MAX_WATCH_GAP_MS = 3000L
         private const val WATCH_FLUSH_MS = 15_000L
         private const val MAX_COUNTED = 4000
+
+        private const val TAG = "ReelCounter"
+        private const val SYSTEM_UI = "com.android.systemui"
+        private const val ERROR_TICK_MS = 2500L       // back-off after a failed tick
+        private const val WAKE_CHECKS = 6             // foreground re-check after screen on / unlock (~1.2 s)
 
         private const val NONE = PageScanner.NONE
         private const val UNKNOWN = PageScanner.UNKNOWN

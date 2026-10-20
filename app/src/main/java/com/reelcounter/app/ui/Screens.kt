@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -69,9 +70,26 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private val OverLimitRed = Color(0xFFFF4D4D)
-private val DATE_LONG: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, d MMMM")
-private val DATE_SHORT: DateTimeFormatter = DateTimeFormatter.ofPattern("EEE, d MMM")
-private val DATE_DAY_MONTH: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM")
+
+/**
+ * A date formatter that follows the current system language. The process now lives for weeks (it hosts the
+ * always-on service), so a formatter built once at class-load time would keep the old language after a change.
+ */
+private class LocaleFormatter(private val pattern: String) {
+    private var locale: Locale? = null
+    private var formatter: DateTimeFormatter? = null
+
+    fun get(): DateTimeFormatter {
+        val current = Locale.getDefault()
+        val cached = formatter
+        if (cached != null && locale == current) return cached
+        return DateTimeFormatter.ofPattern(pattern, current).also { formatter = it; locale = current }
+    }
+}
+
+private val DATE_LONG = LocaleFormatter("EEEE, d MMMM")
+private val DATE_SHORT = LocaleFormatter("EEE, d MMM")
+private val DATE_DAY_MONTH = LocaleFormatter("d MMM")
 
 @Composable
 fun ReelCounterTheme(dark: Boolean, content: @Composable () -> Unit) {
@@ -226,6 +244,7 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
     ) {
         if (!serviceOn) SetupCard()
         if (serviceOn) TrackingStatusCard()
+        if (serviceOn) KeepAliveCard()
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
         WeekCard(counts, limit, today)
@@ -243,7 +262,7 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
     val over = count > limit
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(today.format(DATE_LONG), style = MaterialTheme.typography.labelLarge)
+            Text(today.format(DATE_LONG.get()), style = MaterialTheme.typography.labelLarge)
             Text(
                 count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
@@ -361,7 +380,7 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Average view duration", style = MaterialTheme.typography.titleSmall)
+            Text("Average watch time", style = MaterialTheme.typography.titleSmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
@@ -524,6 +543,36 @@ private fun TrackingStatusCard() {
     }
 }
 
+/**
+ * Many phones (Xiaomi, Oppo, Vivo, Samsung, ...) stop background apps to save battery, which would silently end
+ * 24/7 counting. Shown only while the app is still battery-restricted.
+ */
+@Composable
+private fun KeepAliveCard() {
+    val ctx = LocalContext.current
+    val unrestricted by rememberOnResume(::isBatteryUnrestricted)
+    if (unrestricted) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Keep counting 24/7", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Some phones stop background apps to save battery, which can pause counting. " +
+                    "Open App info → Battery and choose Unrestricted. On Xiaomi, Oppo and Vivo also allow Autostart.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Button(onClick = {
+                runCatching {
+                    ctx.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            }) { Text("Open App info") }
+        }
+    }
+}
+
 @Composable
 private fun SetupCard() {
     val ctx = LocalContext.current
@@ -567,7 +616,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
     val worst = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }
     val barMax = (worst?.value ?: 0).coerceAtLeast(1)
     val daysOver = counts.count { it.value > limit }
-    val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull() } ?: "–"
+    val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH.get()) }.getOrNull() } ?: "–"
 
     LazyColumn(
         modifier.fillMaxSize().wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = 640.dp),
@@ -605,7 +654,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
                 val label = when (d) {
                     today -> "Today"
                     today.minusDays(1) -> "Yesterday"
-                    else -> d.format(DATE_SHORT)
+                    else -> d.format(DATE_SHORT.get())
                 }
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -675,18 +724,25 @@ private fun rememberToday(): LocalDate {
     return today
 }
 
+/** A value that is read once and again every time the screen is resumed (the user may have changed a setting). */
 @Composable
-private fun rememberServiceEnabled(): State<Boolean> {
+private fun rememberOnResume(read: (Context) -> Boolean): State<Boolean> {
     val ctx = LocalContext.current
-    val state = remember { mutableStateOf(isServiceEnabled(ctx)) }
+    val state = remember { mutableStateOf(read(ctx)) }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
-        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) state.value = isServiceEnabled(ctx) }
+        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) state.value = read(ctx) }
         owner.lifecycle.addObserver(obs)
         onDispose { owner.lifecycle.removeObserver(obs) }
     }
     return state
 }
+
+@Composable
+private fun rememberServiceEnabled(): State<Boolean> = rememberOnResume(::isServiceEnabled)
+
+private fun isBatteryUnrestricted(ctx: Context): Boolean =
+    (ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isIgnoringBatteryOptimizations(ctx.packageName) ?: true
 
 private fun isServiceEnabled(ctx: Context): Boolean {
     val enabled = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
