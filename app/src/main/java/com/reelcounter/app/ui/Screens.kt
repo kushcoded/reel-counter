@@ -567,7 +567,7 @@ private fun SourcesCard() {
 @Composable
 private fun Footer() {
     Text(
-        "Licensed under GPLv3.0",
+        "v1.3  .  Licensed under GPLv3.0",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,
