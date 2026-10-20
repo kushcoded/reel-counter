@@ -243,8 +243,6 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
-        if (serviceOn) TrackingStatusCard()
-        if (serviceOn) KeepAliveCard()
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
         WeekCard(counts, limit, today)
@@ -253,6 +251,8 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         PopupCard(todayCount, limit)
         WatchRuleCard()
         SourcesCard()
+        if (serviceOn) TrackingStatusCard()
+        if (serviceOn) KeepAliveCard()
         Footer()
     }
 }
