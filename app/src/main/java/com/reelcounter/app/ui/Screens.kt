@@ -396,9 +396,10 @@ private fun WatchTimeCard(
                 InfoButton(
                     "Average view duration",
                     "How long you stay on a typical reel or short: your watch time divided by the number of " +
-                        "reels counted. A low number means you have attention span of a goldfish; a high one" + 
-                        " means you are a gigachad.\n\n Reels you skip past quickly add a little time but aren't" + 
-                        " counted, so the figure reads slightly high."
+                        "reels counted. A low number means you flick through quickly; a high one means you linger.\n\n" +
+                        "Today uses today's watch time and reels. All time only uses days that have watch time " +
+                        "recorded, so history from before watch time existed doesn't skew it. Reels you skip " +
+                        "past quickly add a little time but aren't counted, so the figure reads slightly high."
                 )
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -566,7 +567,7 @@ private fun SourcesCard() {
 @Composable
 private fun Footer() {
     Text(
-        "v1.3  .  Licensed under GPLv3.0",
+        "Licensed under GPLv3.0",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,

@@ -45,11 +45,6 @@ import kotlinx.coroutines.withTimeoutOrNull
  *  - With one open, a single ticker sleeps as long as it can and is woken by events instead of polling.
  *  - Tree reads are bounded, cached and only happen when something moved (see [PageScanner]).
  *
- * Built to run 24/7:
- *  - With no tracked app open there is no timer, no scroll subscription and no tree access at all.
- *  - With one open, a single ticker sleeps as long as it can and is woken by events instead of polling.
- *  - Tree reads are bounded, cached and only happen when something moved (see [PageScanner]).
- *
  * Everything app-specific lives in [ids] and the constants at the bottom. Instagram and YouTube change
  * their internals from time to time, so if counting stops working, that is the place to tune.
  */
@@ -198,17 +193,6 @@ class ReelCounterService : AccessibilityService() {
         updateEventTypes(appOpen = false)   // scroll events only matter while a tracked app is open
         // The app that is already in front when the service (re)connects was not just opened.
         trackedPlatform(rootInActiveWindow?.packageName?.toString())?.let { setActive(it, countOpen = false) }
-    }
-
-    private fun refreshImePackage() {
-        imePackage = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
-            ?.substringBefore('/')
-    }
-
-    private fun onClockChanged() {
-        DayClock.invalidate()
-        lastDay = ""
-        if (::overlay.isInitialized) overlay.refresh()
     }
 
     private fun refreshImePackage() {
