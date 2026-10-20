@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -54,6 +55,8 @@ import com.reelcounter.app.Distance
 import com.reelcounter.app.Platform
 import com.reelcounter.app.ReelRepository
 import com.reelcounter.app.ReelCounterService
+import com.reelcounter.app.TrackingState
+import com.reelcounter.app.TrackingStatus
 import com.reelcounter.app.WatchTime
 import kotlinx.coroutines.delay
 import java.time.LocalDate
@@ -67,9 +70,26 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private val OverLimitRed = Color(0xFFFF4D4D)
-private val DATE_LONG: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, d MMMM")
-private val DATE_SHORT: DateTimeFormatter = DateTimeFormatter.ofPattern("EEE, d MMM")
-private val DATE_DAY_MONTH: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM")
+
+/**
+ * A date formatter that follows the current system language. The process now lives for weeks (it hosts the
+ * always-on service), so a formatter built once at class-load time would keep the old language after a change.
+ */
+private class LocaleFormatter(private val pattern: String) {
+    private var locale: Locale? = null
+    private var formatter: DateTimeFormatter? = null
+
+    fun get(): DateTimeFormatter {
+        val current = Locale.getDefault()
+        val cached = formatter
+        if (cached != null && locale == current) return cached
+        return DateTimeFormatter.ofPattern(pattern, current).also { formatter = it; locale = current }
+    }
+}
+
+private val DATE_LONG = LocaleFormatter("EEEE, d MMMM")
+private val DATE_SHORT = LocaleFormatter("EEE, d MMM")
+private val DATE_DAY_MONTH = LocaleFormatter("d MMM")
 
 @Composable
 fun ReelCounterTheme(dark: Boolean, content: @Composable () -> Unit) {
@@ -231,6 +251,8 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         PopupCard(todayCount, limit)
         WatchRuleCard()
         SourcesCard()
+        if (serviceOn) TrackingStatusCard()
+        if (serviceOn) KeepAliveCard()
         Footer()
     }
 }
@@ -240,12 +262,12 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
     val over = count > limit
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(24.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(today.format(DATE_LONG), style = MaterialTheme.typography.labelLarge)
+            Text(today.format(DATE_LONG.get()), style = MaterialTheme.typography.labelLarge)
             Text(
                 count.toString(), style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Bold,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurface
             )
-            Text("reels & shorts today", style = MaterialTheme.typography.bodyLarge)
+            Text("Reels & Shorts today", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(12.dp))
             LinearProgressIndicator(
                 progress = { min(1f, count.toFloat() / limit) },
@@ -254,7 +276,7 @@ private fun TodayCard(count: Int, limit: Int, today: LocalDate) {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                if (over) "${count - limit} over your limit of $limit" else "${limit - count} left of $limit",
+                if (over) "$count / $limit · ${count - limit} over limit" else "$count / $limit · ${limit - count} remaining",
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (over) OverLimitRed else MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -268,7 +290,10 @@ private fun LimitCard(limit: Int) {
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CardTitle("Daily limit") {
+            CardTitle(
+                "Daily limit",
+                "Your limit applies to the combined Reels and Shorts count. It changes the progress display but does not block either app."
+            ) {
                 Text("$limit", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             }
             Button(onClick = { edit = true }, modifier = Modifier.fillMaxWidth()) { Text("Set limit") }
@@ -284,12 +309,12 @@ private fun LimitCard(limit: Int) {
         }
         AlertDialog(
             onDismissRequest = { edit = false },
-            title = { Text("Daily reel limit") },
+            title = { Text("Daily limit") },
             text = {
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it.filter(Char::isDigit).take(5) },
-                    label = { Text("Reels & shorts per day") },
+                    label = { Text("Reels + Shorts per day") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { save() }),
@@ -297,10 +322,15 @@ private fun LimitCard(limit: Int) {
                 )
                 LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
             },
-            confirmButton = { TextButton(onClick = { save() }) { Text("Save") } },
-            dismissButton = {
-                TextButton(onClick = { AppSettings.setLimit(AppSettings.DEFAULT_LIMIT); edit = false }) { Text("Reset to ${AppSettings.DEFAULT_LIMIT}") }
-            }
+            confirmButton = {
+                Row {
+                    TextButton(onClick = { text = AppSettings.DEFAULT_LIMIT.toString() }) {
+                        Text("Use default")
+                    }
+                    TextButton(onClick = { save() }) { Text("Save") }
+                }
+            },
+            dismissButton = { TextButton(onClick = { edit = false }) { Text("Cancel") } }
         )
     }
 }
@@ -331,7 +361,7 @@ private fun WeekCard(counts: Map<String, Int>, limit: Int, today: LocalDate) {
                     }
                 }
             }
-            Text("Total $total  ·  avg ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
+            Text("Total $total  ·  Average ${total / 7} per day", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -350,11 +380,10 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Average time per reel", style = MaterialTheme.typography.titleSmall)
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Average watch time", style = MaterialTheme.typography.titleSmall)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
-                Spacer(Modifier.weight(1f))
             }
         }
     }
@@ -364,12 +393,12 @@ private fun WatchTimeCard(
 private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
     val fact = remember(totalReels, cmPerReel) { Distance.funFact(totalReels, cmPerReel) }
     val info = buildString {
-        append("Distance = reels & shorts counted × scroll length per reel (1 short = 1 reel). Changing the length recalculates every day, including past ones.")
+        append("Estimated distance = counted Reels and Shorts × your chosen scroll length. Changing the length also recalculates past estimates.")
         fact.next?.let { append("\n\n").append(it) }
     }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            CardTitle("Distance scrolled", info)
+            CardTitle("Estimated scroll distance", info)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", Distance.formatMeters(Distance.meters(todayReels, cmPerReel)), Modifier.weight(1f))
                 StatBlock("All time", Distance.formatKm(Distance.kilometers(totalReels, cmPerReel)), Modifier.weight(1f))
@@ -377,7 +406,7 @@ private fun DistanceCard(todayReels: Int, totalReels: Int, cmPerReel: Float) {
             Text(fact.text, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             HorizontalDivider()
             Text(
-                "Scroll length per reel: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
+                "Estimated scroll per video: ${String.format(Locale.getDefault(), "%.1f", cmPerReel)} cm",
                 style = MaterialTheme.typography.bodyMedium
             )
             Slider(
@@ -412,12 +441,11 @@ private fun PopupCard(count: Int, limit: Int) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
                 "Floating counter",
-                "Shows your count on top of Instagram, and on YouTube's Shorts screen. You can drag it anywhere on screen and it remembers where you left it. " +
-                        "Transparency only fades the dark background; the number stays solid."
+                "Shows a small draggable count over Instagram and YouTube Shorts. Its position is saved. Transparency affects only the background, not the number."
             ) {
                 Switch(checked = overlayOn, onCheckedChange = { AppSettings.setOverlayEnabled(it) })
             }
-            Text("Background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
+            Text("Popup background transparency ${(transparency * 100).roundToInt()}%", style = MaterialTheme.typography.bodyMedium)
             // Live preview over a mid-tone backdrop, to show how the popup reads on top of video
             Box(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF7C8594)).padding(12.dp),
@@ -451,11 +479,11 @@ private fun WatchRuleCard() {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             CardTitle(
-                "What counts as a reel",
-                "A reel or short counts once you've stayed on it for this many seconds. Scrolling back up and down never counts the same one twice."
+                "Counting rule",
+                "A Reel or Short counts after it stays on screen for this long. Revisiting the same item during the current feed session does not count it again."
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Time on a reel", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Text("Minimum watch time", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 OutlinedButton(onClick = { AppSettings.setSeconds(seconds - 1) }, enabled = seconds > 1) { Text("−") }
                 Text("$seconds s", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 12.dp))
                 OutlinedButton(onClick = { AppSettings.setSeconds(seconds + 1) }, enabled = seconds < 30) { Text("+") }
@@ -469,7 +497,7 @@ private fun WatchRuleCard() {
 private fun SourcesCard() {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            CardTitle("Count from", "Turning an app off stops all counting and the floating counter for it.")
+            CardTitle("Tracked apps", "Turn an app off to stop counting and hide the floating counter in that app.")
             Platform.entries.forEach { p ->
                 val on by AppSettings.tracking(p).collectAsStateWithLifecycle()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -493,6 +521,59 @@ private fun Footer() {
 }
 
 @Composable
+private fun TrackingStatusCard() {
+    val snapshot by TrackingStatus.snapshot.collectAsStateWithLifecycle()
+    val (title, detail) = when {
+        snapshot.state == TrackingState.FEED_ACTIVE -> {
+            val p = snapshot.platform
+            "Tracking active" to if (p != null) "Counting ${p.appName} ${p.label}." else "Counting the current short-video feed."
+        }
+        snapshot.state == TrackingState.APP_ACTIVE -> {
+            val p = snapshot.platform
+            "App detected" to if (p != null) "${p.appName} is open. Waiting for ${p.label}." else "Waiting for a short-video feed."
+        }
+        snapshot.state == TrackingState.TRANSITIONING -> "Checking app" to "Verifying the active screen after an app switch."
+        else -> "Ready" to "Tracking starts automatically when you open Instagram Reels or YouTube Shorts."
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/**
+ * Many phones (Xiaomi, Oppo, Vivo, Samsung, ...) stop background apps to save battery, which would silently end
+ * 24/7 counting. Shown only while the app is still battery-restricted.
+ */
+@Composable
+private fun KeepAliveCard() {
+    val ctx = LocalContext.current
+    val unrestricted by rememberOnResume(::isBatteryUnrestricted)
+    if (unrestricted) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Keep counting 24/7", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Some phones stop background apps to save battery, which can pause counting. " +
+                    "Open App info → Battery and choose Unrestricted. On Xiaomi, Oppo and Vivo also allow Autostart.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Button(onClick = {
+                runCatching {
+                    ctx.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            }) { Text("Open App info") }
+        }
+    }
+}
+
+@Composable
 private fun SetupCard() {
     val ctx = LocalContext.current
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
@@ -502,7 +583,7 @@ private fun SetupCard() {
                 Text("Turn on the counter", style = MaterialTheme.typography.titleMedium)
             }
             Text(
-                "Enable Reel Counter in Accessibility settings so it can see which reel or short you're on. Everything stays on your phone.",
+                "Enable Reel Counter in Accessibility settings so it can recognize Reels and Shorts. Counts and watch time stay on this device.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
@@ -535,7 +616,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
     val worst = counts.maxByOrNull { it.value }?.takeIf { it.value > 0 }
     val barMax = (worst?.value ?: 0).coerceAtLeast(1)
     val daysOver = counts.count { it.value > limit }
-    val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH) }.getOrNull() } ?: "–"
+    val worstDate = worst?.key?.let { runCatching { LocalDate.parse(it).format(DATE_DAY_MONTH.get()) }.getOrNull() } ?: "–"
 
     LazyColumn(
         modifier.fillMaxSize().wrapContentWidth(Alignment.CenterHorizontally).widthIn(max = 640.dp),
@@ -573,7 +654,7 @@ fun HistoryScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int
                 val label = when (d) {
                     today -> "Today"
                     today.minusDays(1) -> "Yesterday"
-                    else -> d.format(DATE_SHORT)
+                    else -> d.format(DATE_SHORT.get())
                 }
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -625,22 +706,43 @@ private fun StatCard(
 @Composable
 private fun rememberToday(): LocalDate {
     var today by remember { mutableStateOf(LocalDate.now()) }
-    LaunchedEffect(Unit) { while (true) { delay(30_000); today = LocalDate.now() } }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) today = LocalDate.now() }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val now = java.time.ZonedDateTime.now()
+            val nextDay = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
+            val waitMs = java.time.Duration.between(now, nextDay).toMillis().coerceAtLeast(1_000L)
+            delay(waitMs)
+            today = LocalDate.now()
+        }
+    }
     return today
 }
 
+/** A value that is read once and again every time the screen is resumed (the user may have changed a setting). */
 @Composable
-private fun rememberServiceEnabled(): State<Boolean> {
+private fun rememberOnResume(read: (Context) -> Boolean): State<Boolean> {
     val ctx = LocalContext.current
-    val state = remember { mutableStateOf(isServiceEnabled(ctx)) }
+    val state = remember { mutableStateOf(read(ctx)) }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
-        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) state.value = isServiceEnabled(ctx) }
+        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) state.value = read(ctx) }
         owner.lifecycle.addObserver(obs)
         onDispose { owner.lifecycle.removeObserver(obs) }
     }
     return state
 }
+
+@Composable
+private fun rememberServiceEnabled(): State<Boolean> = rememberOnResume(::isServiceEnabled)
+
+private fun isBatteryUnrestricted(ctx: Context): Boolean =
+    (ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isIgnoringBatteryOptimizations(ctx.packageName) ?: true
 
 private fun isServiceEnabled(ctx: Context): Boolean {
     val enabled = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false

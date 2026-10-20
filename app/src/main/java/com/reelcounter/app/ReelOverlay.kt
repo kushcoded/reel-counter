@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -23,7 +24,9 @@ import kotlin.math.roundToInt
 class ReelOverlay(private val service: AccessibilityService) {
 
     private val wm = service.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-    private val density = service.resources.displayMetrics.density
+    // Read live: the display size / font scale can change while this long-lived service keeps running.
+    private val density: Float get() = service.resources.displayMetrics.density
+    private var addedAt = 0L
     private var label: TextView? = null
     private var bgDrawable: GradientDrawable? = null
 
@@ -41,7 +44,15 @@ class ReelOverlay(private val service: AccessibilityService) {
     ).apply { gravity = Gravity.TOP or Gravity.START }
 
     fun show() {
-        if (label != null) { refresh(); return }
+        val existing = label
+        if (existing != null) {
+            // The system can silently drop an overlay window. If ours is no longer attached (and was not just
+            // added), forget it and add a fresh one instead of showing nothing until the service restarts.
+            if (existing.isAttachedToWindow || SystemClock.uptimeMillis() - addedAt < REATTACH_GRACE_MS) {
+                refresh(); return
+            }
+            hide()
+        }
         val dm = service.resources.displayMetrics
         params.x = AppSettings.overlayX.coerceIn(0, (dm.widthPixels - (60 * density).toInt()).coerceAtLeast(0))
         params.y = AppSettings.overlayY.coerceIn(0, (dm.heightPixels - (40 * density).toInt()).coerceAtLeast(0))
@@ -49,6 +60,7 @@ class ReelOverlay(private val service: AccessibilityService) {
         try {
             wm.addView(view, params)
             label = view
+            addedAt = SystemClock.uptimeMillis()
             lastCount = -1; lastOver = null; lastBgAlpha = -1
             refresh()
         } catch (_: Exception) {
@@ -64,6 +76,21 @@ class ReelOverlay(private val service: AccessibilityService) {
         bgDrawable = null
     }
 
+    /** Pull the counter back inside the screen after a rotation or display-size change. */
+    fun keepOnScreen() {
+        val view = label ?: return
+        val dm = service.resources.displayMetrics
+        val w = if (view.width > 0) view.width else (60 * density).toInt()
+        val h = if (view.height > 0) view.height else (40 * density).toInt()
+        val x = params.x.coerceIn(0, (dm.widthPixels - w).coerceAtLeast(0))
+        val y = params.y.coerceIn(0, (dm.heightPixels - h).coerceAtLeast(0))
+        if (x != params.x || y != params.y) {
+            params.x = x
+            params.y = y
+            try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+        }
+    }
+
     /** Re-reads count, limit and transparency. Text turns red once the count is above the limit. */
     fun refresh() {
         val view = label ?: return
@@ -75,11 +102,6 @@ class ReelOverlay(private val service: AccessibilityService) {
         if (over != lastOver) { view.setTextColor(if (over) OVER_LIMIT_RED else Color.WHITE); lastOver = over }
         if (bgAlpha != lastBgAlpha) { bgDrawable?.alpha = bgAlpha; lastBgAlpha = bgAlpha }
 
-        if (lastCount in 0 until count) {
-            view.animate().scaleX(1.25f).scaleY(1.25f).setDuration(90).withEndAction {
-                view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
-            }.start()
-        }
         lastCount = count
     }
 
@@ -108,9 +130,15 @@ class ReelOverlay(private val service: AccessibilityService) {
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dm = service.resources.displayMetrics
-                        params.x = (startX + (e.rawX - downX).toInt()).coerceIn(0, dm.widthPixels - view.width)
-                        params.y = (startY + (e.rawY - downY).toInt()).coerceIn(0, dm.heightPixels - view.height)
-                        try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+                        val maxX = (dm.widthPixels - view.width).coerceAtLeast(0)
+                        val maxY = (dm.heightPixels - view.height).coerceAtLeast(0)
+                        val x = (startX + (e.rawX - downX).toInt()).coerceIn(0, maxX)
+                        val y = (startY + (e.rawY - downY).toInt()).coerceIn(0, maxY)
+                        if (x != params.x || y != params.y) {
+                            params.x = x
+                            params.y = y
+                            try { wm.updateViewLayout(view, params) } catch (_: Exception) { }
+                        }
                         true
                     }
                     MotionEvent.ACTION_UP -> {
@@ -126,5 +154,6 @@ class ReelOverlay(private val service: AccessibilityService) {
 
     private companion object {
         const val OVER_LIMIT_RED = 0xFFFF4D4D.toInt()
+        const val REATTACH_GRACE_MS = 1000L
     }
 }
