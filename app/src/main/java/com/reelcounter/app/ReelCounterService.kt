@@ -51,16 +51,21 @@ class ReelCounterService : AccessibilityService() {
          * true: identify it by the readable text on the page in the middle of the screen, polled
          * lightly - scroll events from this pager are unreliable, so they only wake the poll (Shorts).
          */
-        val readsPageKey: Boolean
+        val readsPageKey: Boolean,
+        /**
+         * true: also count reels/videos that autoplay in the app's ordinary home feed (Instagram's FYP),
+         * not only inside the dedicated Reels pager.
+         */
+        val homeFeed: Boolean
     )
 
     private fun ids(p: Platform) = when (p) {
         Platform.Reels -> PagerIds(
-            listOf("clips_tab"), listOf("clips_viewer_view_pager"), popupEverywhere = true, readsPageKey = false
+            listOf("clips_tab"), listOf("clips_viewer_view_pager"), popupEverywhere = true, readsPageKey = false, homeFeed = true
         )
         Platform.Shorts -> PagerIds(
             emptyList(), listOf("reel_recycler", "reel_player_page_container", "reel_watch_fragment_root"),
-            popupEverywhere = false, readsPageKey = true
+            popupEverywhere = false, readsPageKey = true, homeFeed = false
         )
     }
 
@@ -77,6 +82,13 @@ class ReelCounterService : AccessibilityService() {
     private var fallbackCheckedAt = 0L
     private var feedMisses = 0      // consecutive "pager not found" checks; leaving needs several confirmations
     private var lastPollAt = 0L
+    // Home-feed mode (Instagram only): reels inside the ordinary feed, found while the user is scrolling it
+    private var inHome = false
+    private var homeList: AccessibilityNodeInfo? = null
+    private var lastHomeItem: AccessibilityNodeInfo? = null
+    private var lastHomeKey: Int? = null
+    private var lastHomeReadAt = 0L
+    private var lastSeenScrollAt = 0L   // any scroll in the tracked app, even before a feed is detected
 
     // The reel/short currently on screen
     private var currentIndex = NONE
@@ -117,6 +129,7 @@ class ReelCounterService : AccessibilityService() {
             ) { _, _, _ -> }.collect { onSettingsChanged() }
         }
 
+        TrackingStatus.update(TrackingState.IDLE, null)   // never show state left over from a previous run
         updateEventTypes(appOpen = false)   // scroll events only matter while a tracked app is open
         trackedPlatform(rootInActiveWindow?.packageName?.toString())?.let { setActive(it) }
     }
@@ -202,8 +215,12 @@ class ReelCounterService : AccessibilityService() {
     private fun onScroll(event: AccessibilityEvent) {
         val src = active ?: return
         val now = SystemClock.uptimeMillis()
+        lastSeenScrollAt = now
         refreshFeedState(src, now)
-        if (!inFeed) return
+        if (!inFeed) {
+            if (ids(src).homeFeed && now - lastPollAt >= EVENT_POLL_MS) wakeHome(src, now)
+            return
+        }
 
         if (ids(src).readsPageKey) {
             if (now - lastPollAt >= EVENT_POLL_MS) pollPage(src, now, rootInActiveWindow)
@@ -247,12 +264,13 @@ class ReelCounterService : AccessibilityService() {
     private fun startReel(index: Int, now: Long) {
         currentIndex = index
         currentSince = now
-        currentCounted = index != UNKNOWN && index in countedIndices
+        currentCounted = index == NON_VIDEO || (index != UNKNOWN && index in countedIndices)
     }
 
     /** Count the reel on screen once it has been there long enough (and was not counted before). */
     private fun countIfDue(now: Long) {
         if (currentIndex == NONE || currentCounted) return
+        if (currentIndex == UNKNOWN && inHome) return   // home feed: wait until the item is identified
         if (now - currentSince < AppSettings.seconds.value * 1000L) return
         currentCounted = true
         if (currentIndex == UNKNOWN || countedIndices.add(currentIndex)) ReelRepository.store.adjustToday(1)
@@ -264,7 +282,8 @@ class ReelCounterService : AccessibilityService() {
         if (currentIndex == UNKNOWN) {
             // First look after entering: this is the page we have been timing all along.
             currentIndex = key
-            if (currentCounted) countedIndices.add(key) else if (key in countedIndices) currentCounted = true
+            if (key == NON_VIDEO) currentCounted = true
+            else if (currentCounted) countedIndices.add(key) else if (key in countedIndices) currentCounted = true
         } else {
             countIfDue(now)
             startReel(key, now)
@@ -314,9 +333,141 @@ class ReelCounterService : AccessibilityService() {
         return if (hash == NONE || hash == UNKNOWN) hash + 2 else hash
     }
 
+    // ------------------------------------------------------------------ home feed (Instagram FYP)
+
+    /** The user is scrolling the home feed: start identifying which post is in the middle of the screen. */
+    private fun wakeHome(src: Platform, now: Long) {
+        if (!inHome) enterHome(now)
+        pollHome(src, now)
+    }
+
+    private fun enterHome(now: Long) {
+        inHome = true
+        startReel(UNKNOWN, now)
+        updateTrackingStatus()
+    }
+
+    /** Scrolling stopped for a while: stop reading the screen. Already counted items stay remembered. */
+    private fun pauseHome(now: Long) {
+        if (!inHome) return
+        countIfDue(now)
+        inHome = false
+        currentIndex = NONE
+        currentCounted = false
+        homeList = null
+        lastHomeItem = null
+        lastHomeKey = null
+        updateTrackingStatus()
+    }
+
+    /** Periodic part of home-feed counting; returns how long to sleep. */
+    private fun tickHome(src: Platform, now: Long): Long {
+        if (now - lastSeenScrollAt >= HOME_ACTIVE_MS) { pauseHome(now); return TICK_MS }
+        if (!inHome) enterHome(now)
+        pollHome(src, now)
+        countIfDue(now)
+        if (currentIndex == NONE || currentCounted) return POLL_MS
+        val due = currentSince + AppSettings.seconds.value * 1000L
+        return (due - now).coerceIn(MIN_WAKE_MS, POLL_MS)
+    }
+
+    private fun pollHome(src: Platform, now: Long) {
+        lastPollAt = now
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != src.pkg) return
+        readHomeKey(root, now)?.let { observePage(it, now) }
+    }
+
+    /**
+     * Identity of the post in the middle of the home feed: [NON_VIDEO] for photos and other non-reel posts,
+     * otherwise a hash of its first readable texts. Looks for a video marker (a "video"/"clips" view id, or a
+     * description starting with "Reel"/"Video") so photos are never counted. The expensive read is skipped
+     * while the same post is still in the middle and nothing has scrolled since.
+     */
+    private fun readHomeKey(root: AccessibilityNodeInfo, now: Long): Int? {
+        val list = findFeedList(root) ?: return null
+        val dm = resources.displayMetrics
+        val centre = dm.heightPixels / 2
+        val r = Rect()
+        var item: AccessibilityNodeInfo? = null
+        for (i in 0 until list.childCount) {
+            val child = list.getChild(i) ?: continue
+            child.getBoundsInScreen(r)
+            if (r.top <= centre && r.bottom >= centre) { item = child; break }
+        }
+        if (item == null) return null
+        item.getBoundsInScreen(r)
+        // Grid rows (Explore, profiles) and comments are much shorter than a post.
+        if (r.height() < dm.heightPixels * MIN_POST_HEIGHT_RATIO) return NON_VIDEO.also { lastHomeItem = null }
+
+        if (item == lastHomeItem && lastHomeKey != null && lastSeenScrollAt <= lastHomeReadAt) return lastHomeKey
+        lastHomeItem = item
+        lastHomeReadAt = now
+
+        var video = false
+        var hash = 17
+        var texts = 0
+        var visited = 0
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(item)
+        while (queue.isNotEmpty() && visited < MAX_ITEM_NODES) {
+            val node = queue.removeFirst()
+            visited++
+            if (!video) {
+                val id = node.viewIdResourceName
+                val desc = node.contentDescription
+                video = (id != null && VIDEO_ID.containsMatchIn(id)) || (desc != null && VIDEO_DESC.containsMatchIn(desc))
+            }
+            if (texts < MAX_PAGE_TEXTS) {
+                val t = node.text
+                if (t != null && t.length >= MIN_TEXT_LEN && node.isVisibleToUser && !COUNT_LIKE.matches(t)) {
+                    hash = 31 * hash + t.toString().hashCode()
+                    texts++
+                }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
+        }
+        val key = when {
+            !video -> NON_VIDEO
+            texts == 0 -> null                // a reel, but nothing readable yet: look again next poll
+            hash == NONE || hash == UNKNOWN || hash == NON_VIDEO -> hash + 3
+            else -> hash
+        }
+        lastHomeKey = key
+        return key
+    }
+
+    /** The big vertically scrolling list that holds the feed's posts (cached; found by size, not by id). */
+    private fun findFeedList(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        homeList?.let { if (it.refresh() && it.isVisibleToUser) return it }
+        homeList = null
+        val dm = resources.displayMetrics
+        val r = Rect()
+        var visited = 0
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(root)
+        while (queue.isNotEmpty() && visited < MAX_LIST_SEARCH_NODES) {
+            val node = queue.removeFirst()
+            visited++
+            if (node.isScrollable) {
+                node.getBoundsInScreen(r)
+                if (r.height() >= dm.heightPixels * MIN_LIST_HEIGHT_RATIO && r.width() >= dm.widthPixels * MIN_WIDTH_RATIO) {
+                    homeList = node
+                    return node
+                }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
+        }
+        return null
+    }
+
     /** Forget the current pager session. Called when leaving the pager or the app. */
     private fun resetTracking(now: Long) {
         countIfDue(now)   // a reel watched long enough right before leaving still counts
+        inHome = false
+        homeList = null
+        lastHomeItem = null
+        lastHomeKey = null
         currentIndex = NONE
         currentCounted = false
         countedIndices.clear()
@@ -348,6 +499,7 @@ class ReelCounterService : AccessibilityService() {
         if (inFeed == value) return
         inFeed = value
         if (value) {
+            pauseHome(now)    // the dedicated Reels pager takes over from home-feed reading
             watchMark = now
             startReel(UNKNOWN, now)   // the reel shown on entry; its position becomes known on the first scroll
         } else {
@@ -363,7 +515,7 @@ class ReelCounterService : AccessibilityService() {
         TrackingStatus.update(
             when {
                 src == null -> TrackingState.IDLE
-                inFeed -> TrackingState.FEED_ACTIVE
+                inFeed || inHome -> TrackingState.FEED_ACTIVE
                 else -> TrackingState.APP_ACTIVE
             },
             src
@@ -385,7 +537,7 @@ class ReelCounterService : AccessibilityService() {
         val root = if (readsPageKey && inFeed) rootInActiveWindow else null
         refreshFeedState(src, now, root)
         val interval = if (readsPageKey && inFeed) POLL_MS else TICK_MS
-        if (!inFeed) return interval
+        if (!inFeed) return if (ids(src).homeFeed) tickHome(src, now) else interval
 
         if (readsPageKey) pollPage(src, now, root ?: rootInActiveWindow)
         accountWatch(now)
@@ -400,10 +552,14 @@ class ReelCounterService : AccessibilityService() {
     /** Is the Reels/Shorts pager on screen? Cached, since each lookup is an IPC round trip. */
     private fun refreshFeedState(src: Platform, now: Long, preloaded: AccessibilityNodeInfo? = null) {
         if (now - feedCheckedAt < FEED_CACHE_MS) return
-        val root = preloaded ?: rootInActiveWindow ?: return
-        // A mismatched root is common for a few frames during app/window transitions. Do not cache it and do
-        // not turn it into a feed miss; foreground verification decides whether the app was really left.
-        if (root.packageName?.toString() != src.pkg) return
+        val root = preloaded ?: rootInActiveWindow
+        // A missing or mismatched root is common for a few frames during app/window transitions. Retry soon
+        // (but never on every scroll event) and do not turn it into a feed miss; foreground verification
+        // decides whether the app was really left.
+        if (root == null || root.packageName?.toString() != src.pkg) {
+            feedCheckedAt = now - FEED_CACHE_MS + ROOT_RETRY_MS
+            return
+        }
         feedCheckedAt = now
 
         val pager = ids(src)
@@ -416,7 +572,11 @@ class ReelCounterService : AccessibilityService() {
         // App updates occasionally rename internal IDs. Only after repeated misses, and at a much lower
         // frequency, fall back to stable accessibility labels such as a selected "Reels"/"Shorts" tab.
         // The traversal is bounded, so it cannot turn into an unbounded tree scan.
-        if (!found && feedMisses >= 1 && now - fallbackCheckedAt >= FALLBACK_SCAN_MS) {
+        // Only while the feed was just open or the app is actually being scrolled, so ordinary non-feed
+        // screens never pay for the scan.
+        if (!found && feedMisses >= 1 && now - fallbackCheckedAt >= FALLBACK_SCAN_MS &&
+            (inFeed || now - lastSeenScrollAt < FALLBACK_SCROLL_WINDOW_MS)
+        ) {
             fallbackCheckedAt = now
             found = hasSelectedFeedLabel(src, root)
         }
@@ -431,6 +591,10 @@ class ReelCounterService : AccessibilityService() {
 
     private fun hasSelectedFeedLabel(src: Platform, root: AccessibilityNodeInfo): Boolean {
         val wanted = src.label
+        // The feed's tab lives in the bottom navigation bar; a selected "Reels" sub-tab on someone's profile
+        // (higher up the screen) must not count as the feed.
+        val navTop = resources.displayMetrics.heightPixels * BOTTOM_NAV_TOP_RATIO
+        val r = Rect()
         var visited = 0
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.addLast(root)
@@ -440,7 +604,10 @@ class ReelCounterService : AccessibilityService() {
             if (node.isVisibleToUser && node.isSelected) {
                 val text = node.text?.toString()
                 val desc = node.contentDescription?.toString()
-                if (text.equals(wanted, ignoreCase = true) || desc.equals(wanted, ignoreCase = true)) return true
+                if (text.equals(wanted, ignoreCase = true) || desc.equals(wanted, ignoreCase = true)) {
+                    node.getBoundsInScreen(r)
+                    if (r.top >= navTop) return true
+                }
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let(queue::addLast)
         }
@@ -500,9 +667,11 @@ class ReelCounterService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         if (::overlay.isInitialized) overlay.hide()
+        foregroundCheckJob?.cancel()
         val now = SystemClock.uptimeMillis()
         resetTracking(now)
         endWatch(now)
+        TrackingStatus.update(TrackingState.IDLE, null)
         return super.onUnbind(intent)
     }
 
@@ -511,6 +680,7 @@ class ReelCounterService : AccessibilityService() {
         val now = SystemClock.uptimeMillis()
         resetTracking(now)
         endWatch(now)
+        TrackingStatus.update(TrackingState.IDLE, null)
         scope.cancel()
         super.onDestroy()
     }
@@ -522,6 +692,9 @@ class ReelCounterService : AccessibilityService() {
         private const val POLL_MS = 800L          // Shorts page identity; enough for a 3s+ count threshold
         private const val EVENT_POLL_MS = 400L    // scroll events may wake a read, but never faster than this
         private const val FALLBACK_SCAN_MS = 2500L
+        private const val FALLBACK_SCROLL_WINDOW_MS = 3000L
+        private const val ROOT_RETRY_MS = 250L
+        private const val BOTTOM_NAV_TOP_RATIO = 0.8f
         private const val FEED_MISSES_TO_LEAVE = 3
         private const val MAX_FALLBACK_NODES = 64
         private const val MAX_PAGE_NODES = 40
@@ -536,6 +709,14 @@ class ReelCounterService : AccessibilityService() {
         private const val FOREGROUND_SETTLE_MS = 220L
         private const val FOREGROUND_RETRY_MS = 180L
         private const val FOREGROUND_CHECKS = 3
+        private const val HOME_ACTIVE_MS = 8000L      // keep reading the home feed this long after the last scroll
+        private const val MAX_ITEM_NODES = 60
+        private const val MAX_LIST_SEARCH_NODES = 80
+        private const val MIN_POST_HEIGHT_RATIO = 0.4f
+        private const val MIN_LIST_HEIGHT_RATIO = 0.5f
+        private val VIDEO_ID = Regex("video|clips", RegexOption.IGNORE_CASE)
+        private val VIDEO_DESC = Regex("^(reel|video)\\b", RegexOption.IGNORE_CASE)
+        private const val NON_VIDEO = Int.MIN_VALUE + 2   // a post in the home feed that is not a reel/video
         private const val NONE = Int.MIN_VALUE        // not in a pager
         private const val UNKNOWN = Int.MIN_VALUE + 1 // in a pager, position not known yet
     }

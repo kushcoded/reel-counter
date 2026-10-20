@@ -225,7 +225,7 @@ fun HomeScreen(counts: Map<String, Int>, watch: Map<String, Long>, limit: Int, c
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         if (!serviceOn) SetupCard()
-        TrackingStatusCard(serviceOn)
+        if (serviceOn) TrackingStatusCard()
         TodayCard(todayCount, limit, today)
         LimitCard(limit)
         WeekCard(counts, limit, today)
@@ -361,7 +361,7 @@ private fun WatchTimeCard(
                 StatBlock("Daily avg", WatchTime.format(dailyAvgMs), Modifier.weight(1f), compact = true)
             }
             HorizontalDivider()
-            Text("Averege view duration", style = MaterialTheme.typography.titleSmall)
+            Text("Average watch time", style = MaterialTheme.typography.titleSmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatBlock("Today", WatchTime.formatAvg(todayMs, todayReels), Modifier.weight(1f), compact = true)
                 StatBlock("All time", WatchTime.formatAvg(totalMs, reelsOnWatchedDays), Modifier.weight(1f), compact = true)
@@ -502,10 +502,9 @@ private fun Footer() {
 }
 
 @Composable
-private fun TrackingStatusCard(serviceOn: Boolean) {
+private fun TrackingStatusCard() {
     val snapshot by TrackingStatus.snapshot.collectAsStateWithLifecycle()
     val (title, detail) = when {
-        !serviceOn -> "Tracking off" to "Enable the accessibility service to start counting."
         snapshot.state == TrackingState.FEED_ACTIVE -> {
             val p = snapshot.platform
             "Tracking active" to if (p != null) "Counting ${p.appName} ${p.label}." else "Counting the current short-video feed."
@@ -658,6 +657,12 @@ private fun StatCard(
 @Composable
 private fun rememberToday(): LocalDate {
     var today by remember { mutableStateOf(LocalDate.now()) }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) today = LocalDate.now() }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             val now = java.time.ZonedDateTime.now()
