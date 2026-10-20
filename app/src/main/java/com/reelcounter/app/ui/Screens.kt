@@ -560,24 +560,13 @@ private fun SourcesCard() {
                     Switch(checked = on, onCheckedChange = { AppSettings.setTracking(p, it) })
                 }
                 if (p == Platform.Reels) {
-                    val fyp by AppSettings.trackFyp.collectAsStateWithLifecycle()
+                    val home by AppSettings.trackHome.collectAsStateWithLifecycle()
                     Row(Modifier.fillMaxWidth().padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Instagram FYP (beta)", style = MaterialTheme.typography.bodyLarge)
+                        Text("Home page (beta)", style = MaterialTheme.typography.bodyLarge)
                         Spacer(Modifier.width(2.dp))
-                        InfoButton(
-                            "Instagram FYP (beta)",
-                            "Beta feature. It reads Instagram's home feed while you scroll it, to count the reels that " +
-                                "autoplay there and to time how long you watch them.\n\n" +
-                                "It is less reliable than the Reels tab: photos, ads and carousels can occasionally be " +
-                                "mistaken for reels or the other way round, it may stop working after an Instagram " +
-                                "update, and it uses a little more battery while you scroll the feed. If your numbers " +
-                                "look off, turn it off.\n\n" +
-                                "Off (the default): only the Reels tab is counted, and the floating counter shows " +
-                                "only there. On: reels in the home feed are counted and the counter shows throughout " +
-                                "Instagram."
-                        )
+                        InfoButton("Home page (beta)", "Beta: counting on the home page may be inaccurate.")
                         Spacer(Modifier.weight(1f))
-                        Switch(checked = fyp, enabled = on, onCheckedChange = { AppSettings.setTrackFyp(it) })
+                        Switch(checked = home, enabled = on, onCheckedChange = { AppSettings.setTrackHome(it) })
                     }
                 }
             }
@@ -588,7 +577,7 @@ private fun SourcesCard() {
 @Composable
 private fun Footer() {
     Text(
-        "v1.3  .  Licensed under GPLv3.0",
+        "Licensed under GPLv3.0",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,

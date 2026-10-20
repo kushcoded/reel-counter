@@ -36,8 +36,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * leave the Reels/Shorts screen or the app, so a fresh session is never skipped.
  *
  * An app switched off in the settings is ignored completely: no counting, no popup, no scroll events.
- * Instagram's home feed (FYP) is a separate beta switch, off by default; the dedicated Reels tab is always counted.
- * Watch time is timed in the Reels/Shorts pagers and, with FYP on, while a video is on screen in the home feed.
+ * Instagram's home page is a separate beta switch, off by default; the dedicated Reels tab is always counted.
+ * Watch time is timed in the Reels/Shorts pagers and, with the home page on, while a video is on screen there.
  * Each time a tracked app comes to the front is recorded as an "open".
  *
  * Built to run 24/7:
@@ -65,8 +65,8 @@ class ReelCounterService : AccessibilityService() {
          */
         val readsPageKey: Boolean,
         /**
-         * true: the app has an ordinary home feed whose autoplaying reels/videos can be counted too (Instagram's
-         * FYP). Only active while the user's FYP (beta) switch is on, see [homeFeedOn].
+         * true: the app has an ordinary home page whose autoplaying reels/videos can be counted too (Instagram's).
+         * Only active while the user's home page (beta) switch is on, see [homeFeedOn].
          */
         val homeFeed: Boolean
     )
@@ -83,16 +83,16 @@ class ReelCounterService : AccessibilityService() {
 
     private fun ids(p: Platform) = if (p == Platform.Shorts) shortsIds else reelsIds
 
-    /** Is home-feed (FYP) counting on for this app? It needs the app to have one and the beta switch to be on. */
-    private fun homeFeedOn(p: Platform) = ids(p).homeFeed && AppSettings.trackFyp.value
+    /** Is home-page counting on for this app? It needs the app to have one and the beta switch to be on. */
+    private fun homeFeedOn(p: Platform) = ids(p).homeFeed && AppSettings.trackHome.value
 
     /**
      * Show the floating counter on every screen of the app, or only inside the Reels/Shorts pager? Instagram's
-     * follows the FYP switch: the counter belongs wherever reels are being counted.
+     * follows the home page switch: the counter belongs wherever reels are being counted.
      */
     private fun popupEverywhere(p: Platform): Boolean {
         val pager = ids(p)
-        return pager.popupEverywhere && (!pager.homeFeed || AppSettings.trackFyp.value)
+        return pager.popupEverywhere && (!pager.homeFeed || AppSettings.trackHome.value)
     }
 
     // The handler is a last-resort safety net: an uncaught exception in a coroutine on the main thread would
@@ -199,7 +199,7 @@ class ReelCounterService : AccessibilityService() {
         scope.launch {
             combine(
                 AppSettings.overlayEnabled, AppSettings.tracking(Platform.Reels),
-                AppSettings.tracking(Platform.Shorts), AppSettings.trackFyp
+                AppSettings.tracking(Platform.Shorts), AppSettings.trackHome
             ) { _, _, _, _ -> }.collect { runCatching { onSettingsChanged() } }
         }
 
@@ -313,10 +313,13 @@ class ReelCounterService : AccessibilityService() {
     private fun onSettingsChanged() {
         val a = active
         if (a != null && !AppSettings.tracking(a).value) { setActive(null); return }
-        // FYP switched off while its feed was being read: stop reading it and stop timing its video.
-        if (a != null && !homeFeedOn(a)) pauseHome(SystemClock.uptimeMillis())
+        if (a != null) {
+            val now = SystemClock.uptimeMillis()
+            if (homeFeedOn(a)) {
+                if (!inFeed) { lastSeenScrollAt = now; wake() }   // switched on: read the home page right away
+            } else pauseHome(now)                                  // switched off: stop reading and timing it
+        }
         syncOverlay()
-        if (a != null && homeFeedOn(a)) wake()
     }
 
     private fun onScroll(event: AccessibilityEvent) {
@@ -426,7 +429,7 @@ class ReelCounterService : AccessibilityService() {
         scanner.readPagerKey(root, src.pkg, ids(src).viewerIds)?.let { observePage(it, now) }
     }
 
-    // ------------------------------------------------------------------ home feed (Instagram FYP)
+    // ------------------------------------------------------------------ home page (Instagram)
 
     private fun enterHome(now: Long) {
         inHome = true
@@ -437,7 +440,7 @@ class ReelCounterService : AccessibilityService() {
     }
 
     /**
-     * Stop reading the home feed (scrolling stopped and no video is being watched, FYP switched off, or the
+     * Stop reading the home page (scrolling stopped and no video is being watched, switch turned off, or the
      * dedicated Reels pager took over). Already counted items stay remembered.
      */
     private fun pauseHome(now: Long) {
@@ -535,6 +538,8 @@ class ReelCounterService : AccessibilityService() {
         fallbackCheckedAt = 0L
         feedMisses = 0
         lastPollAt = 0L
+        // Home page on: read it from the first moment (an autoplaying video counts without a scroll).
+        if (src != null && homeFeedOn(src)) lastSeenScrollAt = now
         updateEventTypes(src != null)
         tickerJob?.cancel()
         tickerJob = null
