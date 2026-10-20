@@ -59,11 +59,53 @@ class CountStore(private val countsFile: String, private val watchFile: String) 
     }
 }
 
+/**
+ * How many times each tracked app was opened per day, keyed "2026-10-20|Reels" (day, then [Platform.name]).
+ * One small write per open, so it costs nothing while the apps are in use.
+ */
+class OpenStore(private val file: String) {
+    private lateinit var prefs: SharedPreferences
+
+    private val _counts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val counts: StateFlow<Map<String, Int>> = _counts.asStateFlow()
+
+    @Synchronized
+    fun init(context: Context) {
+        if (::prefs.isInitialized) return
+        prefs = context.applicationContext.getSharedPreferences(file, Context.MODE_PRIVATE)
+        _counts.value = prefs.all.mapNotNull { (k, v) -> (v as? Int)?.let { k to it } }.toMap()
+    }
+
+    @Synchronized
+    fun increment(platform: Platform) {
+        val key = key(DayClock.today(), platform)
+        val updated = (_counts.value[key] ?: 0) + 1
+        prefs.edit().putInt(key, updated).apply()
+        _counts.value = _counts.value + (key to updated)
+    }
+
+    @Synchronized
+    fun clearAll() {
+        prefs.edit().clear().apply()
+        _counts.value = emptyMap()
+    }
+
+    companion object {
+        fun key(day: String, platform: Platform) = "$day|${platform.name}"
+    }
+}
+
 object ReelRepository {
     /** Reels and Shorts are merged into one store (1 short = 1 reel). Original file names keep existing history. */
     val store = CountStore("reel_counts", "watch_time")
 
-    fun init(context: Context) = store.init(context)
+    /** App opens per day and app (Instagram, YouTube). */
+    val opens = OpenStore("app_opens")
+
+    fun init(context: Context) {
+        store.init(context)
+        opens.init(context)
+    }
 }
 
 /** User settings + remembered position of the floating counter. */
